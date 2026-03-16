@@ -49,6 +49,12 @@ typedef struct {
     uint16_t id;
     uint8_t dlc;
     uint8_t data[8];
+} uart_msg_t;
+
+typedef struct {
+    uint16_t id;
+    uint8_t dlc;
+    uint8_t data[8];
 } can_msg_t;
 
 /* USER CODE END PTD */
@@ -70,7 +76,7 @@ typedef struct {
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-FDCAN_HandleTypeDef hfdcan1;
+FDCAN_HandleTypeDef hfdcan2;
 
 I2C_HandleTypeDef hi2c2;
 
@@ -84,15 +90,29 @@ DMA_HandleTypeDef hdma_usart1_tx;
 
 static GT911_Object_t gt911;
 
+// Charts and variables for storing voltage/ current measurements received via UART
 static lv_chart_series_t * s_v = NULL; // voltage chart
 static lv_chart_series_t * s_i = NULL; // current chart
+static float output_v = 350.0;
+static float output_i = 5.0;
 static lv_timer_t * charts_timer = NULL; // chart exclusive timer
 
+// Ring buffer for storing received UART messages
 static volatile uint8_t rb[RB_SZ];
 static volatile uint16_t rb_w = 0, rb_r = 0;
 static uint8_t rx_chunk[128];
 
-static volatile uint16_t print_debug = 0;
+// Send and receive FDCAN messages
+/* static FDCAN_TxHeaderTypeDef TxHeader;
+static FDCAN_RxHeaderTypeDef RxHeader;
+static uint8_t TxData_CAN[64];
+static uint8_t RxData_CAN[64];
+
+volatile can_msg_t q[QLEN];
+volatile uint8_t qw=0, qr=0;
+
+uint8_t tx_frame[1+1+1+4+1+64+1];
+static volatile uint8_t uart_tx_busy = 0; */
 
 /* USER CODE END PV */
 
@@ -101,26 +121,36 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_SPI1_Init(void);
-static void MX_I2C2_Init(void);
 static void MX_USART1_UART_Init(void);
-static void MX_FDCAN1_Init(void);
+static void MX_FDCAN2_Init(void);
+static void MX_I2C2_Init(void);
 /* USER CODE BEGIN PFP */
 
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
+// Core functions for display update and touch screen reading
+void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map);
+void touch_read(lv_indev_t * indev, lv_indev_data_t * data);
+
+// CAN message rx
+static uint8_t dlc_to_len(uint32_t dlc);
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs);
 static uint8_t xor_crc(const uint8_t *p, uint16_t n);
+static void send_can(uint32_t id, uint8_t ext, uint8_t fd, const uint8_t *data, uint8_t len);
 static void textarea_trim(lv_obj_t * ta);
-static void log_can_to_textarea(const can_msg_t *m);
-void loop_uart_can_logs(void);
+
+// UART data tx, rx + dislay and plotting
 static void rb_push(uint8_t b);
 static int rb_pop(uint8_t *b);
-static int parser_poll(can_msg_t *out);
+static int parser_poll(uart_msg_t *out);
 static void set_voltage_label(float v);
 static void set_current_label(float i);
 static void charts_init(void);
-static void charts_feed_sim_cb(lv_timer_t * t);
+static void charts_feed_cb(lv_timer_t * t);
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
+static uint8_t xor_crc(const uint8_t *p, uint16_t n);
+static void log_uart_data(const uart_msg_t *m);
+void loop_uart_logs(void);
 void start_sim_charts(void);
-void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map);
-void touch_read(lv_indev_t * indev, lv_indev_data_t * data);
 
 /* USER CODE END PFP */
 
@@ -160,9 +190,9 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_SPI1_Init();
-  MX_I2C2_Init();
   MX_USART1_UART_Init();
-  MX_FDCAN1_Init();
+  MX_FDCAN2_Init();
+  MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
 
   /* LCD initialization */
@@ -211,12 +241,51 @@ int main(void)
   ui_init();
 
   /* Chart initialization */
-//  start_sim_charts();
+  start_sim_charts();
 
   /* UART initialization */
   HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_chunk, sizeof(rx_chunk));
   __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
 
+  /* CAN initialization */
+  // 1) Configure filter: accept ALL standard IDs into RX FIFO0
+
+  /*
+  FDCAN_FilterTypeDef sFilter;
+  sFilter.IdType = FDCAN_STANDARD_ID;
+  sFilter.FilterIndex = 0;
+  sFilter.FilterType = FDCAN_FILTER_MASK;
+  sFilter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+  sFilter.FilterID1 = 0x000;     // ID
+  sFilter.FilterID2 = 0x000;     // mask 0 = accept all
+  if (HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilter) != HAL_OK) Error_Handler();
+
+  // 2) Global filter: accept non-matching frames too
+  HAL_FDCAN_ConfigGlobalFilter(&hfdcan2,
+                              FDCAN_ACCEPT_IN_RX_FIFO0,
+                              FDCAN_ACCEPT_IN_RX_FIFO0,
+                              FDCAN_REJECT_REMOTE,
+                              FDCAN_REJECT_REMOTE);
+
+  // 3) Start FDCAN
+  if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK) Error_Handler();
+
+  // 4) Enable RX FIFO0 new message interrupt
+  if (HAL_FDCAN_ActivateNotification(&hfdcan2,
+          FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) Error_Handler();
+
+  // 5) Prepare TX header (classic CAN, 8 bytes)
+  TxHeader.Identifier = 0x123;
+  TxHeader.IdType = FDCAN_STANDARD_ID;
+  TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+  TxHeader.DataLength = FDCAN_DLC_BYTES_8;
+  TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  TxHeader.BitRateSwitch = FDCAN_BRS_OFF;     // classic
+  TxHeader.FDFormat = FDCAN_CLASSIC_CAN;      // classic
+  TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  TxHeader.MessageMarker = 0;
+
+  */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -224,7 +293,7 @@ int main(void)
   while (1)
   {
 
-	  loop_uart_can_logs();
+	  loop_uart_logs();
 	  /* Provide updates to currently-displayed Widgets here. */
 	  lv_timer_handler();
 	  HAL_Delay(5);  /* Wait 5 milliseconds before processing LVGL timer again*/
@@ -283,45 +352,45 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief FDCAN1 Initialization Function
+  * @brief FDCAN2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_FDCAN1_Init(void)
+static void MX_FDCAN2_Init(void)
 {
 
-  /* USER CODE BEGIN FDCAN1_Init 0 */
+  /* USER CODE BEGIN FDCAN2_Init 0 */
 
-  /* USER CODE END FDCAN1_Init 0 */
+  /* USER CODE END FDCAN2_Init 0 */
 
-  /* USER CODE BEGIN FDCAN1_Init 1 */
+  /* USER CODE BEGIN FDCAN2_Init 1 */
 
-  /* USER CODE END FDCAN1_Init 1 */
-  hfdcan1.Instance = FDCAN1;
-  hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
-  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
-  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.AutoRetransmission = DISABLE;
-  hfdcan1.Init.TransmitPause = DISABLE;
-  hfdcan1.Init.ProtocolException = DISABLE;
-  hfdcan1.Init.NominalPrescaler = 16;
-  hfdcan1.Init.NominalSyncJumpWidth = 1;
-  hfdcan1.Init.NominalTimeSeg1 = 1;
-  hfdcan1.Init.NominalTimeSeg2 = 1;
-  hfdcan1.Init.DataPrescaler = 1;
-  hfdcan1.Init.DataSyncJumpWidth = 1;
-  hfdcan1.Init.DataTimeSeg1 = 1;
-  hfdcan1.Init.DataTimeSeg2 = 1;
-  hfdcan1.Init.StdFiltersNbr = 0;
-  hfdcan1.Init.ExtFiltersNbr = 0;
-  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
-  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+  /* USER CODE END FDCAN2_Init 1 */
+  hfdcan2.Instance = FDCAN2;
+  hfdcan2.Init.ClockDivider = FDCAN_CLOCK_DIV1;
+  hfdcan2.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+  hfdcan2.Init.Mode = FDCAN_MODE_NORMAL;
+  hfdcan2.Init.AutoRetransmission = DISABLE;
+  hfdcan2.Init.TransmitPause = DISABLE;
+  hfdcan2.Init.ProtocolException = DISABLE;
+  hfdcan2.Init.NominalPrescaler = 16;
+  hfdcan2.Init.NominalSyncJumpWidth = 1;
+  hfdcan2.Init.NominalTimeSeg1 = 1;
+  hfdcan2.Init.NominalTimeSeg2 = 1;
+  hfdcan2.Init.DataPrescaler = 1;
+  hfdcan2.Init.DataSyncJumpWidth = 1;
+  hfdcan2.Init.DataTimeSeg1 = 1;
+  hfdcan2.Init.DataTimeSeg2 = 1;
+  hfdcan2.Init.StdFiltersNbr = 0;
+  hfdcan2.Init.ExtFiltersNbr = 0;
+  hfdcan2.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+  if (HAL_FDCAN_Init(&hfdcan2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN FDCAN1_Init 2 */
+  /* USER CODE BEGIN FDCAN2_Init 2 */
 
-  /* USER CODE END FDCAN1_Init 2 */
+  /* USER CODE END FDCAN2_Init 2 */
 
 }
 
@@ -499,19 +568,20 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LCD_RST_GPIO_Port, LCD_RST_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LCD_RS_GPIO_Port, LCD_RS_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, LCD_BL_Pin|LCD_CS_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin : TOUCH_INT_Pin */
-  GPIO_InitStruct.Pin = TOUCH_INT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  /*Configure GPIO pin : LCD_CS_Pin */
+  GPIO_InitStruct.Pin = LCD_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(TOUCH_INT_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(LCD_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LCD_RST_Pin */
   GPIO_InitStruct.Pin = LCD_RST_Pin;
@@ -520,19 +590,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LCD_RST_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LCD_RS_Pin LCD_CS_Pin */
-  GPIO_InitStruct.Pin = LCD_RS_Pin|LCD_CS_Pin;
+  /*Configure GPIO pin : LCD_RS_Pin */
+  GPIO_InitStruct.Pin = LCD_RS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : LCD_BL_Pin */
-  GPIO_InitStruct.Pin = LCD_BL_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LCD_BL_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(LCD_RS_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -575,33 +638,23 @@ static void textarea_trim(lv_obj_t * ta)
     lv_textarea_set_text(ta, "");
 }
 
-static void log_can_to_textarea(const can_msg_t *m)
+static void log_uart_data(const uart_msg_t *m)
 {
-    char line[96];
-    int n = snprintf(line, sizeof(line), "ID:%03X DLC:%u DATA:", m->id, m->dlc);
-
-    for(int i=0;i<m->dlc && n < (int)sizeof(line)-4; i++)
-        n += snprintf(&line[n], sizeof(line)-n, " %02X", m->data[i]);
-
-    textarea_trim(objects.uart_logs);
-    lv_textarea_add_text(objects.uart_logs, line);
-
-    const char * txt = lv_textarea_get_text(objects.uart_logs);
-    size_t len = strlen(txt);
-    if(len < lv_textarea_get_max_length(objects.uart_logs)) {
-    	lv_textarea_add_text(objects.uart_logs, "\n"); // new line only if not last line
+    if(m->id == 0x01 && m->dlc >= 4)
+    {
+        memcpy(&output_v, m->data, sizeof(float));
     }
-
-    //keep view pinned to bottom
-    lv_textarea_set_cursor_pos(objects.uart_logs, LV_TEXTAREA_CURSOR_LAST);
-    print_debug++;
+    else if(m->id == 0x02 && m->dlc >= 4)
+    {
+        memcpy(&output_i, m->data, sizeof(float));
+    }
 }
 
-void loop_uart_can_logs(void)
+void loop_uart_logs(void)
 {
-    can_msg_t m;
+    uart_msg_t m;
     while (parser_poll(&m)) {
-        log_can_to_textarea(&m);
+        log_uart_data(&m);
     }
 }
 
@@ -619,11 +672,11 @@ static int rb_pop(uint8_t *b){
     return 1;
 }
 
-static int parser_poll(can_msg_t *out)
+static int parser_poll(uart_msg_t *out)
 {
-    enum { S_SOF, S_TYPE, S_FLAGS, S_ID0, S_ID1, S_ID2, S_ID3, S_LEN, S_DATA, S_CRC };
+    enum { S_SOF, S_ID0, S_ID1, S_LEN, S_DATA, S_CRC };
     static uint8_t st = S_SOF;
-    static uint8_t buf[1+1+1+4+1+64];   // everything except CRC
+    static uint8_t buf[1+2+1+8];   // everything except CRC
     static uint8_t idx = 0;
     static uint8_t need = 0;
 
@@ -637,29 +690,16 @@ static int parser_poll(can_msg_t *out)
             if (b == 0xA5) {
                 idx = 0;
                 buf[idx++] = b;
-                st = S_TYPE;
+                st = S_ID0;
             }
             break;
 
-        case S_TYPE:
-            if (b != 0x01) { st = S_SOF; break; }
-            buf[idx++] = b;
-            st = S_FLAGS;
-            break;
-
-        case S_FLAGS:
-            buf[idx++] = b;
-            st = S_ID0;
-            break;
-
         case S_ID0: buf[idx++] = b; st = S_ID1; break;
-        case S_ID1: buf[idx++] = b; st = S_ID2; break;
-        case S_ID2: buf[idx++] = b; st = S_ID3; break;
-        case S_ID3: buf[idx++] = b; st = S_LEN; break;
+        case S_ID1: buf[idx++] = b; st = S_LEN; break;
 
         case S_LEN:
             need = b;                 // number of data bytes to read
-            if (need > 64) { st = S_SOF; break; }
+            if (need > 8) { st = S_SOF; break; }
             buf[idx++] = b;
             st = (need == 0) ? S_CRC : S_DATA;
             break;
@@ -670,24 +710,29 @@ static int parser_poll(can_msg_t *out)
             break;
 
         case S_CRC:
-        {
-            uint8_t crc = xor_crc(buf, idx);
-            if (crc == b)
-            {
-                // decode into can_msg_t
-                uint32_t id =  (uint32_t)buf[3]
-                             | ((uint32_t)buf[4] << 8)
-                             | ((uint32_t)buf[5] << 16)
-                             | ((uint32_t)buf[6] << 24);
+			{
+				uint8_t crc = xor_crc(buf, idx);
+				if (crc == b)
+				{
+					// Frame layout:
+					// buf[0] = SOF
+					// buf[1] = ID0
+					// buf[2] = ID1
+					// buf[3] = LEN
+					// buf[4...] = DATA
 
-                out->id  = (uint16_t)id;     // you defined id as uint16_t
-                out->dlc = buf[7];
-                if(out->dlc > 8) out->dlc = 8;
-                for (int i=0; i<out->dlc; i++) out->data[i] = buf[8+i];
+					out->id  = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
+					out->dlc = buf[3];
 
-                st = S_SOF;
-                return 1;
-            }
+					if (out->dlc > 8) out->dlc = 8;
+
+					for (int i = 0; i < out->dlc; i++) {
+						out->data[i] = buf[4 + i];
+					}
+
+					st = S_SOF;
+					return 1;
+				}
             st = S_SOF;
             break;
         }
@@ -739,35 +784,31 @@ static void charts_init(void)
     lv_chart_set_type(ci, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(ci, 120);
     lv_chart_set_update_mode(ci, LV_CHART_UPDATE_MODE_SHIFT);
-    lv_chart_set_axis_range(ci, LV_CHART_AXIS_PRIMARY_Y, 0, 20); // amps
+    lv_chart_set_axis_range(ci, LV_CHART_AXIS_PRIMARY_Y, 0, 10); // amps
     s_i = lv_chart_add_series(ci, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
 
     // Seed with starting values so charts aren't empty
     for(int k = 0; k < 120; k++) {
         lv_chart_set_next_value(cv, s_v, get_var_target_battery_voltage() / 2);
-        lv_chart_set_next_value(ci, s_i, 20 / 2);
+        lv_chart_set_next_value(ci, s_i, 10 / 2);
     }
 }
 
-static void charts_feed_sim_cb(lv_timer_t * t)
+static void charts_feed_cb(lv_timer_t * t)
 {
     (void)t;
 
-    // Screen-specific to delete off-screen graph?
-    // if(!lv_obj_is_valid(objects.output_voltage_chart)) return;
-
     static float ts = 0.0f;
-    ts += 0.5f; // 500 ms step if timer period is 500 ms
+    ts += 0.5f; // 500 ms step as timer also has 500 ms step
 
-    // Simulated CC->CV-ish shape:
-    float v = 350.0f + 70.0f * (1.0f - expf(-ts / 60.0f)) + 0.8f * sinf(ts * 0.7f);
-    float i = 10.0f  + 11.0f * expf(-ts / 45.0f)        + 2.0f * sinf(ts * 0.9f);
+    float v = output_v;
+    float i = output_i;
 
     // Clamp to chart ranges
     if(v < 0) v = 0;
     if(v > 600) v = 600;
-    if(i < 0) i =   0;
-    if(i > 20) i = 20;
+    if(i < 0) i = 0;
+    if(i > 10) i = 10;
 
     // Set chart series
     lv_chart_set_next_value(objects.output_voltage_chart, s_v, (int32_t)v);
@@ -782,7 +823,7 @@ void start_sim_charts(void)
 {
     charts_init();
     if(charts_timer == NULL) {
-        charts_timer = lv_timer_create(charts_feed_sim_cb, 500, NULL);
+        charts_timer = lv_timer_create(charts_feed_cb, 500, NULL);
     }
 }
 
@@ -829,6 +870,77 @@ void touch_read(lv_indev_t * indev, lv_indev_data_t * data)
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }
+/*
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+{
+    if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0) return;
+
+    if(HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData_CAN) != HAL_OK)
+        return;
+
+    uint32_t id  = RxHeader.Identifier;
+    uint8_t  len = dlc_to_len(RxHeader.DataLength);
+
+    uint8_t is_ext = (RxHeader.IdType == FDCAN_EXTENDED_ID) ? 1 : 0;
+    uint8_t is_fd  = (RxHeader.FDFormat == FDCAN_FD_CAN) ? 1 : 0;
+
+    send_can(id, is_ext, is_fd, RxData_CAN, len);
+
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if(huart->Instance == USART1) uart_tx_busy = 0;
+}
+
+
+static uint8_t dlc_to_len(uint32_t dlc)
+{
+	switch(dlc) {
+		case FDCAN_DLC_BYTES_0:  return 0;
+	    case FDCAN_DLC_BYTES_1:  return 1;
+	    case FDCAN_DLC_BYTES_2:  return 2;
+	    case FDCAN_DLC_BYTES_3:  return 3;
+	    case FDCAN_DLC_BYTES_4:  return 4;
+	    case FDCAN_DLC_BYTES_5:  return 5;
+	    case FDCAN_DLC_BYTES_6:  return 6;
+	    case FDCAN_DLC_BYTES_7:  return 7;
+	    case FDCAN_DLC_BYTES_8:  return 8;
+	    case FDCAN_DLC_BYTES_12: return 12;
+	    case FDCAN_DLC_BYTES_16: return 16;
+	    case FDCAN_DLC_BYTES_20: return 20;
+	    case FDCAN_DLC_BYTES_24: return 24;
+	    case FDCAN_DLC_BYTES_32: return 32;
+	    case FDCAN_DLC_BYTES_48: return 48;
+	    case FDCAN_DLC_BYTES_64: return 64;
+	    default: return 8;
+	}
+}
+
+static void send_can(uint32_t id, uint8_t ext, uint8_t fd,
+                          const uint8_t *data, uint8_t len)
+{
+    uint16_t idx = 0;
+    tx_frame[idx++] = 0xA5;
+    tx_frame[idx++] = 0x01;
+    tx_frame[idx++] = (ext ? 1 : 0) | (fd ? 2 : 0);
+
+    tx_frame[idx++] = (uint8_t)(id);
+    tx_frame[idx++] = (uint8_t)(id >> 8);
+    tx_frame[idx++] = (uint8_t)(id >> 16);
+    tx_frame[idx++] = (uint8_t)(id >> 24);
+
+    tx_frame[idx++] = len;
+    for(uint8_t i=0; i<len; i++) tx_frame[idx++] = data[i];
+
+    tx_frame[idx++] = xor_crc(tx_frame, idx);
+
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+
+    // TODO: do something with received CAN message or enable sending CAN message
+}
+
+*/
 
 /* USER CODE END 4 */
 
