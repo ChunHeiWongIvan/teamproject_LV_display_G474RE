@@ -190,7 +190,7 @@ void create_screen_charging_menu() {
             lv_obj_set_pos(obj, 384, 213);
             lv_obj_set_size(obj, 30, 75);
             lv_scale_set_mode(obj, LV_SCALE_MODE_VERTICAL_RIGHT);
-            lv_scale_set_range(obj, 0, 20);
+            lv_scale_set_range(obj, 0, 10);
             lv_scale_set_angle_range(obj, 270);
             lv_scale_set_rotation(obj, 135);
             lv_scale_set_total_tick_count(obj, 11);

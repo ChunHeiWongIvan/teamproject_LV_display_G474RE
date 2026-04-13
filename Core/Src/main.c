@@ -47,8 +47,7 @@ extern void LCD_IO_Init(void);
 
 typedef struct {
     uint16_t id;
-    uint8_t dlc;
-    uint8_t data[8];
+    uint8_t data[2];
 } uart_msg_t;
 
 typedef struct {
@@ -66,7 +65,11 @@ typedef struct {
 #define RESOLUTION_VERTICAL 320
 #define BYTES_PER_PIXEL 2
 
-#define RB_SZ 1024
+#define UART_DMA_RX_SZ 256 // UART circular DMA RX buffer size
+
+/* UART message packet protocol */
+#define UART_ID_VOLTAGE 0x0001
+#define UART_ID_CURRENT 0x0002
 
 /* USER CODE END PD */
 
@@ -88,19 +91,39 @@ DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
 
-static GT911_Object_t gt911;
+static GT911_Object_t gt911; // GT911 touch screen controller
 
 // Charts and variables for storing voltage/ current measurements received via UART
 static lv_chart_series_t * s_v = NULL; // voltage chart
 static lv_chart_series_t * s_i = NULL; // current chart
-static float output_v = 350.0;
-static float output_i = 5.0;
+static float output_v = 0.0f;
+static float output_i = 0.0f;
 static lv_timer_t * charts_timer = NULL; // chart exclusive timer
 
-// Ring buffer for storing received UART messages
-static volatile uint8_t rb[RB_SZ];
-static volatile uint16_t rb_w = 0, rb_r = 0;
-static uint8_t rx_chunk[128];
+// UART TX variables
+uint8_t tx_frame[1+2+2+1];
+static volatile uint8_t uart_tx_busy = 0;
+
+// Buffer for storing UART messages by circular DMA
+static uint8_t uart_dma_rx[UART_DMA_RX_SZ];
+static volatile uint16_t uart_dma_last_pos = 0;
+
+// UART Debugging
+typedef struct {
+    volatile uint32_t irq_hits;
+    volatile uint32_t rx_cb_hits;
+    volatile uint32_t rx_events;
+    volatile uint16_t last_size;
+    volatile uint8_t last_bytes[8];
+} uart_dbg_t;
+
+uart_dbg_t g_uart_dbg = {0};
+
+volatile uint32_t g_uart_err_hits = 0;
+volatile uint32_t g_uart_last_err = 0;
+volatile uint32_t g_uart_last_isr = 0;
+
+static volatile uint8_t dbg_captured = 0;
 
 // Send and receive FDCAN messages
 /* static FDCAN_TxHeaderTypeDef TxHeader;
@@ -126,31 +149,39 @@ static void MX_FDCAN2_Init(void);
 static void MX_I2C2_Init(void);
 /* USER CODE BEGIN PFP */
 
-// Core functions for display update and touch screen reading
+// === Display update and touch screen ===
 void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map);
 void touch_read(lv_indev_t * indev, lv_indev_data_t * data);
 
-// CAN message rx
+// === CAN message RX ===
+/*
 static uint8_t dlc_to_len(uint32_t dlc);
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs);
-static uint8_t xor_crc(const uint8_t *p, uint16_t n);
-static void send_can(uint32_t id, uint8_t ext, uint8_t fd, const uint8_t *data, uint8_t len);
 static void textarea_trim(lv_obj_t * ta);
+*/
 
-// UART data tx, rx + dislay and plotting
-static void rb_push(uint8_t b);
-static int rb_pop(uint8_t *b);
-static int parser_poll(uart_msg_t *out);
+// === UART Debugging ===
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart);
+static uint8_t xor_crc(const uint8_t *p, uint16_t n);
+
+// === UART data TX, encoding and framing ===
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
+static void uart_send_voltage(float v);
+static void uart_send_current(float i);
+static void uart_send_msg(uint16_t id, const uint8_t *data);
+
+// === UART data RX, parsing and processing ===
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
+static int parser_feed_byte(uint8_t b, uart_msg_t *out);
+static void uart_rx_process_dma(void);
+static void log_uart_data(const uart_msg_t *m);
+
+// === UART data plotting ===
 static void set_voltage_label(float v);
 static void set_current_label(float i);
 static void charts_init(void);
 static void charts_feed_cb(lv_timer_t * t);
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
-static uint8_t xor_crc(const uint8_t *p, uint16_t n);
-static void log_uart_data(const uart_msg_t *m);
-void loop_uart_logs(void);
-void start_sim_charts(void);
+void start_charts(void);
 
 /* USER CODE END PFP */
 
@@ -241,10 +272,10 @@ int main(void)
   ui_init();
 
   /* Chart initialization */
-  start_sim_charts();
+  start_charts();
 
   /* UART initialization */
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_chunk, sizeof(rx_chunk));
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_dma_rx, UART_DMA_RX_SZ);
   __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
 
   /* CAN initialization */
@@ -292,11 +323,19 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  /* Processes UART RX stored in buffer */
+	  uart_rx_process_dma(); // TODO: parse and process RX without polling
 
-	  loop_uart_logs();
+	  /* UART TX for target battery voltage setting */
+	  float target_voltage = (float) get_var_target_battery_voltage();
+	  uart_send_voltage(target_voltage);
+
 	  /* Provide updates to currently-displayed Widgets here. */
 	  lv_timer_handler();
-	  HAL_Delay(5);  /* Wait 5 milliseconds before processing LVGL timer again*/
+	  HAL_Delay(5);  /* Wait 5 ms before processing LVGL and UART again */
+
+	  /* Note that UART baud rate is 115200 bits per second, or 86.806 us per byte.
+	   * For the 6 byte frame, transmission takes at least 520.836 us. */
 
     /* USER CODE END WHILE */
 
@@ -604,24 +643,91 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+// === Display update and touch screen ===
+
+void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map)
 {
-    if(huart->Instance != USART1) return;
+    const uint16_t w = (uint16_t)(area->x2 - area->x1 + 1);
+    const uint16_t h = (uint16_t)(area->y2 - area->y1 + 1);
 
-    for(uint16_t i = 0; i < Size; i++)
-    {
-        rb_push(rx_chunk[i]);
-    }
+    uint16_t * p = (uint16_t *)px_map;
 
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_chunk, sizeof(rx_chunk));
-    __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+    // Sets window and streams w*h pixels
+    ili9488_DrawRGBImage((uint16_t)area->x1, (uint16_t)area->y1, w, h, p);
+
+    // Indicate that the buffer is available
+    lv_display_flush_ready(display);
 }
 
-static uint8_t xor_crc(const uint8_t *p, uint16_t n)
+void touch_read(lv_indev_t * indev, lv_indev_data_t * data)
 {
-	uint8_t c = 0;
-	for(uint16_t i=0;i<n;i++) c ^= p[i];
-	return c;
+    (void) indev;
+
+    GT911_State_t st;
+
+    if(GT911_GetState(&gt911, &st) != GT911_OK) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+
+    if(st.TouchDetected) {
+
+    	// Swap + mirror coordinates for LCD rotation
+
+        uint32_t x = st.TouchY;
+        uint32_t y = st.TouchX;
+        x = (RESOLUTION_HORIZONTAL - 1) - x;          // mirror X
+
+        data->point.x = (lv_coord_t)x;
+        data->point.y = (lv_coord_t)y;
+        data->state   = LV_INDEV_STATE_PRESSED;
+    }
+    else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
+// === CAN message RX ===
+
+/*
+static uint8_t dlc_to_len(uint32_t dlc)
+{
+	switch(dlc) {
+		case FDCAN_DLC_BYTES_0:  return 0;
+	    case FDCAN_DLC_BYTES_1:  return 1;
+	    case FDCAN_DLC_BYTES_2:  return 2;
+	    case FDCAN_DLC_BYTES_3:  return 3;
+	    case FDCAN_DLC_BYTES_4:  return 4;
+	    case FDCAN_DLC_BYTES_5:  return 5;
+	    case FDCAN_DLC_BYTES_6:  return 6;
+	    case FDCAN_DLC_BYTES_7:  return 7;
+	    case FDCAN_DLC_BYTES_8:  return 8;
+	    case FDCAN_DLC_BYTES_12: return 12;
+	    case FDCAN_DLC_BYTES_16: return 16;
+	    case FDCAN_DLC_BYTES_20: return 20;
+	    case FDCAN_DLC_BYTES_24: return 24;
+	    case FDCAN_DLC_BYTES_32: return 32;
+	    case FDCAN_DLC_BYTES_48: return 48;
+	    case FDCAN_DLC_BYTES_64: return 64;
+	    default: return 8;
+	}
+}
+
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+{
+    if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0) return;
+
+    if(HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData_CAN) != HAL_OK)
+        return;
+
+    uint32_t id  = RxHeader.Identifier;
+    uint8_t  len = dlc_to_len(RxHeader.DataLength);
+
+    uint8_t is_ext = (RxHeader.IdType == FDCAN_EXTENDED_ID) ? 1 : 0;
+    uint8_t is_fd  = (RxHeader.FDFormat == FDCAN_FD_CAN) ? 1 : 0;
+
+    send_can(id, is_ext, is_fd, RxData_CAN, len);
+
 }
 
 static void textarea_trim(lv_obj_t * ta)
@@ -637,110 +743,217 @@ static void textarea_trim(lv_obj_t * ta)
 
     lv_textarea_set_text(ta, "");
 }
+*/
 
-static void log_uart_data(const uart_msg_t *m)
+// === UART Debugging ===
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    if(m->id == 0x01 && m->dlc >= 4)
-    {
-        memcpy(&output_v, m->data, sizeof(float));
-    }
-    else if(m->id == 0x02 && m->dlc >= 4)
-    {
-        memcpy(&output_i, m->data, sizeof(float));
-    }
+    if (huart->Instance != USART1) return;
+
+    g_uart_err_hits++;
+    g_uart_last_err = huart->ErrorCode;
+    g_uart_last_isr = huart->Instance->ISR;
+
+    HAL_UART_AbortReceive(huart);
+    uart_dma_last_pos = 0;
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_dma_rx, UART_DMA_RX_SZ);
 }
 
-void loop_uart_logs(void)
+static uint8_t xor_crc(const uint8_t *p, uint16_t n)
 {
-    uart_msg_t m;
-    while (parser_poll(&m)) {
-        log_uart_data(&m);
-    }
+	uint8_t c = 0;
+	for(uint16_t i=0;i<n;i++) c ^= p[i];
+	return c;
 }
 
-static void rb_push(uint8_t b){
-    uint16_t n = (rb_w + 1) % RB_SZ;
-    if(n == rb_r) return; // overflow drop
-    rb[rb_w] = b;
-    rb_w = n;
-}
+// === UART data TX, encoding and framing ===
 
-static int rb_pop(uint8_t *b){
-    if(rb_r == rb_w) return 0;
-    *b = rb[rb_r];
-    rb_r = (rb_r + 1) % RB_SZ;
-    return 1;
-}
-
-static int parser_poll(uart_msg_t *out)
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-    enum { S_SOF, S_ID0, S_ID1, S_LEN, S_DATA, S_CRC };
+    if(huart->Instance == USART1) uart_tx_busy = 0;
+}
+
+static void uart_send_voltage(float v)
+{
+	int val = (int)(v * 10.0f + 0.5f);   // convert to xxx.x format
+	uint8_t data[2];
+
+	uint8_t d0 = (val / 1000) % 10;
+	uint8_t d1 = (val / 100)  % 10;
+	uint8_t d2 = (val / 10)   % 10;
+	uint8_t d3 =  val % 10;
+
+	data[0] = (d0 << 4) | d1;
+	data[1] = (d2 << 4) | d3;
+
+    uart_send_msg(UART_ID_VOLTAGE, data);
+}
+
+static void uart_send_current(float i)
+{
+	int val = (int)(i * 100.0f + 0.5f);   // convert to xx.xx format
+	uint8_t data[2];
+
+	uint8_t d0 = (val / 1000) % 10;
+	uint8_t d1 = (val / 100)  % 10;
+	uint8_t d2 = (val / 10)   % 10;
+	uint8_t d3 =  val % 10;
+
+	data[0] = (d0 << 4) | d1;
+	data[1] = (d2 << 4) | d3;
+
+    uart_send_msg(UART_ID_CURRENT, data);
+}
+
+static void uart_send_msg(uint16_t id, const uint8_t *data)
+{
+    while (uart_tx_busy) {}      // wait until previous TX is complete
+    uart_tx_busy = 1;
+
+    uint16_t idx = 0;
+    tx_frame[idx++] = 0xA5;                 // SOF
+    tx_frame[idx++] = (uint8_t)(id & 0xFF); // ID low byte
+    tx_frame[idx++] = (uint8_t)(id >> 8);   // ID high byte
+
+    tx_frame[idx++] = data[0];
+    tx_frame[idx++] = data[1];
+
+    uint8_t crc = xor_crc(tx_frame, idx);
+    tx_frame[idx++] = crc;
+
+    if(HAL_UART_Transmit_DMA(&huart1, tx_frame, idx) != HAL_OK) {
+        uart_tx_busy = 0;
+    }
+
+}
+
+// === UART data RX, parsing and processing ===
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    if (huart->Instance != USART1) return;
+
+    g_uart_dbg.rx_cb_hits++;
+    g_uart_dbg.last_size = Size;
+
+}
+
+static int parser_feed_byte(uint8_t b, uart_msg_t *out)
+{
+    enum { S_SOF, S_ID0, S_ID1, S_DATA0, S_DATA1, S_CRC };
     static uint8_t st = S_SOF;
-    static uint8_t buf[1+2+1+8];   // everything except CRC
+    static uint8_t buf[1+2+2];
     static uint8_t idx = 0;
-    static uint8_t need = 0;
 
-    uint8_t b;
-
-    while (rb_pop(&b))
+    switch (st)
     {
-        switch (st)
+    case S_SOF:
+        if (b == 0xA5) {
+            idx = 0;
+            buf[idx++] = b;
+            st = S_ID0;
+        }
+        break;
+
+    case S_ID0:
+        buf[idx++] = b;
+        st = S_ID1;
+        break;
+
+    case S_ID1:
+        buf[idx++] = b;
+        st = S_DATA0;
+        break;
+
+    case S_DATA0:
+        buf[idx++] = b;
+        st = S_DATA1;
+        break;
+
+    case S_DATA1:
+        buf[idx++] = b;
+        st = S_CRC;
+        break;
+
+    case S_CRC:
+    {
+        uint8_t crc = xor_crc(buf, idx);
+        if (crc == b)
         {
-        case S_SOF:
-            if (b == 0xA5) {
-                idx = 0;
-                buf[idx++] = b;
-                st = S_ID0;
-            }
-            break;
-
-        case S_ID0: buf[idx++] = b; st = S_ID1; break;
-        case S_ID1: buf[idx++] = b; st = S_LEN; break;
-
-        case S_LEN:
-            need = b;                 // number of data bytes to read
-            if (need > 8) { st = S_SOF; break; }
-            buf[idx++] = b;
-            st = (need == 0) ? S_CRC : S_DATA;
-            break;
-
-        case S_DATA:
-            buf[idx++] = b;
-            if (--need == 0) st = S_CRC;
-            break;
-
-        case S_CRC:
-			{
-				uint8_t crc = xor_crc(buf, idx);
-				if (crc == b)
-				{
-					// Frame layout:
-					// buf[0] = SOF
-					// buf[1] = ID0
-					// buf[2] = ID1
-					// buf[3] = LEN
-					// buf[4...] = DATA
-
-					out->id  = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
-					out->dlc = buf[3];
-
-					if (out->dlc > 8) out->dlc = 8;
-
-					for (int i = 0; i < out->dlc; i++) {
-						out->data[i] = buf[4 + i];
-					}
-
-					st = S_SOF;
-					return 1;
-				}
+            out->id = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
+            out->data[0] = buf[3];
+            out->data[1] = buf[4];
             st = S_SOF;
-            break;
+            return 1;
         }
-        }
+        st = S_SOF;
+        break;
+    }
     }
 
     return 0;
 }
+
+static void uart_rx_process_dma(void)
+{
+    uart_msg_t m;
+    uint16_t pos = UART_DMA_RX_SZ - __HAL_DMA_GET_COUNTER(huart1.hdmarx);
+
+    if (pos != uart_dma_last_pos)
+    {
+        if (pos > uart_dma_last_pos)
+        {
+            for (uint16_t i = uart_dma_last_pos; i < pos; i++)
+            {
+                if (parser_feed_byte(uart_dma_rx[i], &m)) {
+                    log_uart_data(&m);
+                }
+            }
+        }
+        else
+        {
+            for (uint16_t i = uart_dma_last_pos; i < UART_DMA_RX_SZ; i++)
+            {
+                if (parser_feed_byte(uart_dma_rx[i], &m)) {
+                    log_uart_data(&m);
+                }
+            }
+            for (uint16_t i = 0; i < pos; i++)
+            {
+                if (parser_feed_byte(uart_dma_rx[i], &m)) {
+                    log_uart_data(&m);
+                }
+            }
+        }
+
+        uart_dma_last_pos = pos;
+    }
+}
+
+static void log_uart_data(const uart_msg_t *m)
+{
+    uint8_t d0 = (m->data[0] >> 4) & 0x0F;
+    uint8_t d1 =  m->data[0]       & 0x0F;
+    uint8_t d2 = (m->data[1] >> 4) & 0x0F;
+    uint8_t d3 =  m->data[1]       & 0x0F;
+
+    // Check that each nibble must be a decimal digit 0..9
+    if(d0 > 9 || d1 > 9 || d2 > 9 || d3 > 9) return;
+
+    if(m->id == 0x01)
+    {
+        // Voltage format: xxx.x
+        output_v = (float)(d0 * 100 + d1 * 10 + d2) + ((float)d3 / 10.0f);
+    }
+    else if(m->id == 0x02)
+    {
+        // Current format: xx.xx
+        output_i = (float)(d0 * 10 + d1) + ((float)(d2 * 10 + d3) / 100.0f);
+    }
+}
+
+// === UART data plotting ===
 
 static void set_voltage_label(float v)
 {
@@ -786,12 +999,6 @@ static void charts_init(void)
     lv_chart_set_update_mode(ci, LV_CHART_UPDATE_MODE_SHIFT);
     lv_chart_set_axis_range(ci, LV_CHART_AXIS_PRIMARY_Y, 0, 10); // amps
     s_i = lv_chart_add_series(ci, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
-
-    // Seed with starting values so charts aren't empty
-    for(int k = 0; k < 120; k++) {
-        lv_chart_set_next_value(cv, s_v, get_var_target_battery_voltage() / 2);
-        lv_chart_set_next_value(ci, s_i, 10 / 2);
-    }
 }
 
 static void charts_feed_cb(lv_timer_t * t)
@@ -819,128 +1026,13 @@ static void charts_feed_cb(lv_timer_t * t)
     set_current_label(i);
 }
 
-void start_sim_charts(void)
+void start_charts(void)
 {
     charts_init();
     if(charts_timer == NULL) {
-        charts_timer = lv_timer_create(charts_feed_cb, 500, NULL);
+        charts_timer = lv_timer_create(charts_feed_cb, 500, NULL); // 500 ms timer for updating charts
     }
 }
-
-/* flush callback for display */
-void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map)
-{
-    const uint16_t w = (uint16_t)(area->x2 - area->x1 + 1);
-    const uint16_t h = (uint16_t)(area->y2 - area->y1 + 1);
-
-    uint16_t * p = (uint16_t *)px_map;
-
-    // Sets window and streams w*h pixels
-    ili9488_DrawRGBImage((uint16_t)area->x1, (uint16_t)area->y1, w, h, p);
-
-    // Indicate that the buffer is available
-    lv_display_flush_ready(display);
-}
-
-/* input device read callback for touch */
-void touch_read(lv_indev_t * indev, lv_indev_data_t * data)
-{
-    (void) indev;
-
-    GT911_State_t st;
-
-    if(GT911_GetState(&gt911, &st) != GT911_OK) {
-        data->state = LV_INDEV_STATE_RELEASED;
-        return;
-    }
-
-    if(st.TouchDetected) {
-
-    	// Swap + mirror coordinates for LCD rotation
-
-        uint32_t x = st.TouchY;
-        uint32_t y = st.TouchX;
-        x = (RESOLUTION_HORIZONTAL - 1) - x;          // mirror X
-
-        data->point.x = (lv_coord_t)x;
-        data->point.y = (lv_coord_t)y;
-        data->state   = LV_INDEV_STATE_PRESSED;
-    }
-    else {
-        data->state = LV_INDEV_STATE_RELEASED;
-    }
-}
-/*
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
-{
-    if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0) return;
-
-    if(HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData_CAN) != HAL_OK)
-        return;
-
-    uint32_t id  = RxHeader.Identifier;
-    uint8_t  len = dlc_to_len(RxHeader.DataLength);
-
-    uint8_t is_ext = (RxHeader.IdType == FDCAN_EXTENDED_ID) ? 1 : 0;
-    uint8_t is_fd  = (RxHeader.FDFormat == FDCAN_FD_CAN) ? 1 : 0;
-
-    send_can(id, is_ext, is_fd, RxData_CAN, len);
-
-}
-
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if(huart->Instance == USART1) uart_tx_busy = 0;
-}
-
-
-static uint8_t dlc_to_len(uint32_t dlc)
-{
-	switch(dlc) {
-		case FDCAN_DLC_BYTES_0:  return 0;
-	    case FDCAN_DLC_BYTES_1:  return 1;
-	    case FDCAN_DLC_BYTES_2:  return 2;
-	    case FDCAN_DLC_BYTES_3:  return 3;
-	    case FDCAN_DLC_BYTES_4:  return 4;
-	    case FDCAN_DLC_BYTES_5:  return 5;
-	    case FDCAN_DLC_BYTES_6:  return 6;
-	    case FDCAN_DLC_BYTES_7:  return 7;
-	    case FDCAN_DLC_BYTES_8:  return 8;
-	    case FDCAN_DLC_BYTES_12: return 12;
-	    case FDCAN_DLC_BYTES_16: return 16;
-	    case FDCAN_DLC_BYTES_20: return 20;
-	    case FDCAN_DLC_BYTES_24: return 24;
-	    case FDCAN_DLC_BYTES_32: return 32;
-	    case FDCAN_DLC_BYTES_48: return 48;
-	    case FDCAN_DLC_BYTES_64: return 64;
-	    default: return 8;
-	}
-}
-
-static void send_can(uint32_t id, uint8_t ext, uint8_t fd,
-                          const uint8_t *data, uint8_t len)
-{
-    uint16_t idx = 0;
-    tx_frame[idx++] = 0xA5;
-    tx_frame[idx++] = 0x01;
-    tx_frame[idx++] = (ext ? 1 : 0) | (fd ? 2 : 0);
-
-    tx_frame[idx++] = (uint8_t)(id);
-    tx_frame[idx++] = (uint8_t)(id >> 8);
-    tx_frame[idx++] = (uint8_t)(id >> 16);
-    tx_frame[idx++] = (uint8_t)(id >> 24);
-
-    tx_frame[idx++] = len;
-    for(uint8_t i=0; i<len; i++) tx_frame[idx++] = data[i];
-
-    tx_frame[idx++] = xor_crc(tx_frame, idx);
-
-    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-
-    // TODO: do something with received CAN message or enable sending CAN message
-}
-
-*/
 
 /* USER CODE END 4 */
 
