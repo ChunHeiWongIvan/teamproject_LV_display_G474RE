@@ -20,7 +20,7 @@ int32_t GT911_IO_GetTick(void)
 int32_t GT911_IO_ReadReg(uint16_t devAddr, uint16_t reg,
                          uint8_t *pData, uint16_t len)
 {
-    if (HAL_I2C_Mem_Read(&hi2c2,
+    if (HAL_I2C_Mem_Read(&hi2c1,
                          devAddr,
                          reg,
                          I2C_MEMADD_SIZE_16BIT,
@@ -37,7 +37,7 @@ int32_t GT911_IO_ReadReg(uint16_t devAddr, uint16_t reg,
 int32_t GT911_IO_WriteReg(uint16_t devAddr, uint16_t reg,
                           uint8_t *pData, uint16_t len)
 {
-    if (HAL_I2C_Mem_Write(&hi2c2,
+    if (HAL_I2C_Mem_Write(&hi2c1,
                           devAddr,
                           reg,
                           I2C_MEMADD_SIZE_16BIT,
