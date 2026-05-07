@@ -277,8 +277,7 @@ int main(void)
   start_charts();
 
   /* UART initialization */
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_dma_rx, UART_DMA_RX_SZ);
-  __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_dma_rx, UART_DMA_RX_SZ); // RX event interrupt called when buffer is full, half full or line is IDLE for 1 byte
 
   /* CAN initialization */
   // 1) Configure filter: accept ALL standard IDs into RX FIFO0
