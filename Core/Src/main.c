@@ -125,6 +125,8 @@ volatile uint32_t g_uart_last_isr = 0;
 
 static volatile uint8_t dbg_captured = 0;
 
+static volatile uint16_t uart_idle_hits = 0;
+
 // Send and receive FDCAN messages
 /* static FDCAN_TxHeaderTypeDef TxHeader;
 static FDCAN_RxHeaderTypeDef RxHeader;
@@ -323,8 +325,6 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  /* Processes UART RX stored in buffer */
-	  uart_rx_process_dma(); // TODO: parse and process RX without polling
 
 	  /* UART TX for target battery voltage setting */
 	  float target_voltage = (float) get_var_target_battery_voltage();
@@ -332,7 +332,7 @@ int main(void)
 
 	  /* Provide updates to currently-displayed Widgets here. */
 	  lv_timer_handler();
-	  HAL_Delay(5);  /* Wait 5 ms before processing LVGL and UART again */
+	  HAL_Delay(5);  /* Wait 5 ms before processing LVGL again */
 
 	  /* Note that UART baud rate is 115200 bits per second, or 86.806 us per byte.
 	   * For the 6 byte frame, transmission takes at least 520.836 us. */
@@ -832,11 +832,11 @@ static void uart_send_msg(uint16_t id, const uint8_t *data)
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-    if (huart->Instance != USART1) return;
-
-    g_uart_dbg.rx_cb_hits++;
-    g_uart_dbg.last_size = Size;
-
+	if (huart->Instance == USART1)
+	{
+		uart_rx_process_dma(); // Process received message
+		uart_idle_hits++;
+	}
 }
 
 static int parser_feed_byte(uint8_t b, uart_msg_t *out)
