@@ -84,12 +84,21 @@ FDCAN_HandleTypeDef hfdcan2;
 I2C_HandleTypeDef hi2c1;
 
 SPI_HandleTypeDef hspi1;
+DMA_HandleTypeDef hdma_spi1_tx;
 
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
 DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
+
+static lv_display_t * active_lv_display = NULL; // for SPI DMA screen flush callback
+volatile uint32_t lcd_dma_done_count = 0;
+volatile uint32_t LCD_IO_Busy = 0;
+
+volatile uint32_t dbg_flush_count = 0;
+volatile uint32_t dbg_flush_pixels = 0;
+volatile uint32_t dbg_flush_ready_fallback = 0;
 
 static GT911_Object_t gt911; // GT911 touch screen controller
 
@@ -230,7 +239,6 @@ int main(void)
 
   /* LCD initialization */
 
-  LCD_IO_Init();
   ili9488_Init();
   ili9488_DisplayOn();
 
@@ -257,9 +265,17 @@ int main(void)
   /* LVGL display initialization */
   lv_display_t * display = lv_display_create(RESOLUTION_HORIZONTAL, RESOLUTION_VERTICAL);
 
-  /* LVGL will render to this 1/10 screen sized buffer for 2 bytes/pixel */
-  static uint8_t buf[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 10 * BYTES_PER_PIXEL];
+  /* LVGL will render to these two 1/10 screen sized buffers for 2 bytes/pixel */
+  /* One buffer renders while the other buffer is flushed by DMA for parallelization  */
+  static uint8_t buf1[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 10 * BYTES_PER_PIXEL];
+  static uint8_t buf2[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 10 * BYTES_PER_PIXEL];
+  lv_display_set_buffers(display, buf1, buf2, sizeof(buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+  /* UNUSED: benchmark against one 1/5 screen sized buffer*/
+  /*
+  static uint8_t buf[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 5 * BYTES_PER_PIXEL];
   lv_display_set_buffers(display, buf, NULL, sizeof(buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
+  */
 
   /* Displays rendered image */
   lv_display_set_flush_cb(display, my_flush_cb);
@@ -326,12 +342,12 @@ int main(void)
   {
 
 	  /* UART TX for target battery voltage setting */
-	  float target_voltage = (float) get_var_target_battery_voltage();
-	  uart_send_voltage(target_voltage);
+	  // float target_voltage = (float) get_var_target_battery_voltage();
+	  // uart_send_voltage(target_voltage);
 
 	  /* Provide updates to currently-displayed Widgets here. */
 	  lv_timer_handler();
-	  HAL_Delay(5);  /* Wait 5 ms before processing LVGL again */
+	  HAL_Delay(2);  /* Wait 2 ms before processing LVGL again */
 
 	  /* Note that UART baud rate is 115200 bits per second, or 86.806 us per byte.
 	   * For the 6 byte frame, transmission takes at least 520.836 us. */
@@ -585,6 +601,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 
 }
 
@@ -646,16 +665,29 @@ static void MX_GPIO_Init(void)
 
 void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map)
 {
-    const uint16_t w = (uint16_t)(area->x2 - area->x1 + 1);
-    const uint16_t h = (uint16_t)(area->y2 - area->y1 + 1);
+    uint16_t w = area->x2 - area->x1 + 1;
+    uint16_t h = area->y2 - area->y1 + 1;
 
-    uint16_t * p = (uint16_t *)px_map;
+    active_lv_display = display;
 
-    // Sets window and streams w*h pixels
-    ili9488_DrawRGBImage((uint16_t)area->x1, (uint16_t)area->y1, w, h, p);
+    ili9488_DrawRGBImage(area->x1, area->y1, w, h, (uint16_t *)px_map);
 
-    // Indicate that the buffer is available
-    lv_display_flush_ready(display);
+    LCD_IO_Busy = LCD_IO_DmaBusy();
+
+    if(!LCD_IO_DmaBusy()) {
+        lv_display_flush_ready(display);
+        active_lv_display = NULL;
+    }
+}
+
+void LCD_IO_DmaTxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    lcd_dma_done_count++;
+
+    if(active_lv_display) {
+        lv_display_flush_ready(active_lv_display);
+        active_lv_display = NULL;
+    }
 }
 
 void touch_read(lv_indev_t * indev, lv_indev_data_t * data)

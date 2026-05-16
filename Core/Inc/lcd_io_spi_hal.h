@@ -122,7 +122,7 @@ void LCD_IO_DmaRxCpltCallback(SPI_HandleTypeDef *hspi);
 /* DMA TX/RX enable/disable
    - 0: DMA disable
    - 1: DMA enable */
-#define LCD_DMA_TX            0
+#define LCD_DMA_TX            1
 #define LCD_DMA_RX            0
 
 /* In dma mode the bitmap drawing function is completed before the actual drawing.
@@ -130,7 +130,7 @@ void LCD_IO_DmaRxCpltCallback(SPI_HandleTypeDef *hspi);
    - 0: DMA check and wait at drawing function start
    - 1: DMA check and wait at drawing function start + bitmap drawing function end wait on (default mode)
    - 2: DMA wait at drawing function end */
-#define LCD_DMA_ENDWAIT       1
+#define LCD_DMA_ENDWAIT       0
 
 /* Because there are DMA capable and DMA unable memory regions
    here we can set what is the DMA unable region condition
@@ -153,6 +153,6 @@ void LCD_IO_DmaRxCpltCallback(SPI_HandleTypeDef *hspi);
 
 /* Pixel buffer size for DMA bitdepth conversion (buffer size [byte] = 3 * pixel buffer size)
    note: if 0 -> does not use DMA for 24-bit drawing and reading */
-#define LCD_RGB24_BUFFSIZE    0
+#define LCD_RGB24_BUFFSIZE    4096
 
 #endif
