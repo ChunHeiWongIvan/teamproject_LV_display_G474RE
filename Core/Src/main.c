@@ -45,6 +45,15 @@ extern void LCD_IO_Init(void);
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef enum
+{
+	CHARGER_IDLE_NC_BAT,
+	CHARGER_IDLE_C_BAT,
+    CHARGER_PRECHARGE,
+    CHARGER_CHARGING,
+    CHARGER_FAULT
+} charger_state_t; // Charger states: Idle (battery not connected), Idle (battery connected), Pre-Charge, Charging, Fault
+
 typedef struct {
     uint16_t id;
     uint8_t data[2];
@@ -54,7 +63,7 @@ typedef struct {
     uint16_t id;
     uint8_t dlc;
     uint8_t data[8];
-} can_msg_t;
+} can_msg_t; // UNUSED: for future CAN TX development
 
 /* USER CODE END PTD */
 
@@ -92,21 +101,38 @@ DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
 
-static lv_display_t * active_lv_display = NULL; // for SPI DMA screen flush callback
-volatile uint32_t lcd_dma_done_count = 0;
-volatile uint32_t LCD_IO_Busy = 0;
+static volatile charger_state_t charger_state = CHARGER_IDLE_NC_BAT; // Initialize charger state at IDLE and not connected to battery
 
-volatile uint32_t dbg_flush_count = 0;
-volatile uint32_t dbg_flush_pixels = 0;
-volatile uint32_t dbg_flush_ready_fallback = 0;
+static lv_display_t * active_lv_display = NULL; // for SPI DMA screen flush callback
 
 static GT911_Object_t gt911; // GT911 touch screen controller
 
+// Variables for storing target voltage/ current received via CAN
+static volatile float target_v = 0.0f;
+static volatile float target_i = 0.0f;
+
 // Charts and variables for storing voltage/ current measurements received via UART
-static lv_chart_series_t * s_v = NULL; // voltage chart
-static lv_chart_series_t * s_i = NULL; // current chart
-static float output_v = 0.0f;
-static float output_i = 0.0f;
+static lv_chart_series_t * s_o_v = NULL; // output voltage chart
+static lv_chart_series_t * s_o_i = NULL; // output current chart
+static lv_chart_series_t * s_o_p = NULL; // output power chart
+
+static lv_chart_series_t * s_b_v = NULL; // battery voltage chart
+
+static lv_chart_series_t * s_p_v = NULL; // PFC voltage chart
+static lv_chart_series_t * s_p_i = NULL; // PFC current chart
+
+static lv_chart_series_t * s_t_1 = NULL; // temperature 1 chart
+static lv_chart_series_t * s_t_2 = NULL; // temperature 2 chart
+static lv_chart_series_t * s_t_3 = NULL; // temperature 3 chart
+
+static volatile float output_v = 0.0f; // output voltage
+static volatile float output_i = 0.0f; // output current
+static volatile float output_p = 0.0f; // output power
+static volatile float battery_v = 0.0f; // battery voltage
+static volatile float pfc_v = 0.0f; // PFC voltage
+static volatile float pfc_i = 0.0f; // PFC current
+static volatile float temp[3] = {0.0f}; // temperature 1, 2, 3
+
 static lv_timer_t * charts_timer = NULL; // chart exclusive timer
 
 // UART TX variables
@@ -116,37 +142,6 @@ static volatile uint8_t uart_tx_busy = 0;
 // Buffer for storing UART messages by circular DMA
 static uint8_t uart_dma_rx[UART_DMA_RX_SZ];
 static volatile uint16_t uart_dma_last_pos = 0;
-
-// UART Debugging
-typedef struct {
-    volatile uint32_t irq_hits;
-    volatile uint32_t rx_cb_hits;
-    volatile uint32_t rx_events;
-    volatile uint16_t last_size;
-    volatile uint8_t last_bytes[8];
-} uart_dbg_t;
-
-uart_dbg_t g_uart_dbg = {0};
-
-volatile uint32_t g_uart_err_hits = 0;
-volatile uint32_t g_uart_last_err = 0;
-volatile uint32_t g_uart_last_isr = 0;
-
-static volatile uint8_t dbg_captured = 0;
-
-static volatile uint16_t uart_idle_hits = 0;
-
-// Send and receive FDCAN messages
-/* static FDCAN_TxHeaderTypeDef TxHeader;
-static FDCAN_RxHeaderTypeDef RxHeader;
-static uint8_t TxData_CAN[64];
-static uint8_t RxData_CAN[64];
-
-volatile can_msg_t q[QLEN];
-volatile uint8_t qw=0, qr=0;
-
-uint8_t tx_frame[1+1+1+4+1+64+1];
-static volatile uint8_t uart_tx_busy = 0; */
 
 /* USER CODE END PV */
 
@@ -163,13 +158,18 @@ static void MX_I2C1_Init(void);
 // === Display update and touch screen ===
 void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map);
 void touch_read(lv_indev_t * indev, lv_indev_data_t * data);
+void LCD_IO_DmaTxCpltCallback(SPI_HandleTypeDef *hspi);
 
-// === CAN message RX ===
-/*
-static uint8_t dlc_to_len(uint32_t dlc);
+// === Live menu updates ===
+const char * get_var_voltage_text(float v);
+const char * get_var_current_text(float i);
+const char * get_var_power_text(float p);
+const char * get_var_temperature_text(float t);
+void update_debug_states(void);
+
+// === CAN message RX, parsing and processing ===
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs);
-static void textarea_trim(lv_obj_t * ta);
-*/
+static void log_can_data(uint8_t *data);
 
 // === UART Debugging ===
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart);
@@ -188,8 +188,6 @@ static void uart_rx_process_dma(void);
 static void log_uart_data(const uart_msg_t *m);
 
 // === UART data plotting ===
-static void set_voltage_label(float v);
-static void set_current_label(float i);
 static void charts_init(void);
 static void charts_feed_cb(lv_timer_t * t);
 void start_charts(void);
@@ -265,23 +263,16 @@ int main(void)
   /* LVGL display initialization */
   lv_display_t * display = lv_display_create(RESOLUTION_HORIZONTAL, RESOLUTION_VERTICAL);
 
-  /* LVGL will render to these two 1/10 screen sized buffers for 2 bytes/pixel */
-  /* One buffer renders while the other buffer is flushed by DMA for parallelization  */
-  static uint8_t buf1[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 10 * BYTES_PER_PIXEL];
-  static uint8_t buf2[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 10 * BYTES_PER_PIXEL];
+  /* LVGL will render to two 1/16 screen sized buffers for 2 bytes/pixel */
+  /* One buffer flushes via DMA while the other renders in parallel */
+  static uint8_t buf1[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 16 * BYTES_PER_PIXEL];
+  static uint8_t buf2[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 16 * BYTES_PER_PIXEL];
   lv_display_set_buffers(display, buf1, buf2, sizeof(buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
-
-  /* UNUSED: benchmark against one 1/5 screen sized buffer*/
-  /*
-  static uint8_t buf[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 5 * BYTES_PER_PIXEL];
-  lv_display_set_buffers(display, buf, NULL, sizeof(buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
-  */
 
   /* Displays rendered image */
   lv_display_set_flush_cb(display, my_flush_cb);
 
   /* LVGL pointer (touch) initialization */
-
   lv_indev_t * indev = lv_indev_create();
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(indev, touch_read);
@@ -297,43 +288,33 @@ int main(void)
 
   /* CAN initialization */
   // 1) Configure filter: accept ALL standard IDs into RX FIFO0
-
-  /*
   FDCAN_FilterTypeDef sFilter;
-  sFilter.IdType = FDCAN_STANDARD_ID;
+  sFilter.IdType = FDCAN_EXTENDED_ID;
   sFilter.FilterIndex = 0;
   sFilter.FilterType = FDCAN_FILTER_MASK;
   sFilter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-  sFilter.FilterID1 = 0x000;     // ID
-  sFilter.FilterID2 = 0x000;     // mask 0 = accept all
-  if (HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilter) != HAL_OK) Error_Handler();
+  sFilter.FilterID1 = 0x00000000;
+  sFilter.FilterID2 = 0x00000000;
+  if(HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilter) != HAL_OK)
+  {
+      Error_Handler();
+  }
 
-  // 2) Global filter: accept non-matching frames too
+  // 2) Global filter: reject non-matching frames
   HAL_FDCAN_ConfigGlobalFilter(&hfdcan2,
-                              FDCAN_ACCEPT_IN_RX_FIFO0,
-                              FDCAN_ACCEPT_IN_RX_FIFO0,
-                              FDCAN_REJECT_REMOTE,
-                              FDCAN_REJECT_REMOTE);
+                               FDCAN_REJECT,
+                               FDCAN_REJECT,
+                               FDCAN_REJECT_REMOTE,
+                               FDCAN_REJECT_REMOTE);
 
   // 3) Start FDCAN
-  if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK) Error_Handler();
+  HAL_FDCAN_Start(&hfdcan2);
 
   // 4) Enable RX FIFO0 new message interrupt
-  if (HAL_FDCAN_ActivateNotification(&hfdcan2,
-          FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) Error_Handler();
+  HAL_FDCAN_ActivateNotification(&hfdcan2,
+                                 FDCAN_IT_RX_FIFO0_NEW_MESSAGE,
+                                 0);
 
-  // 5) Prepare TX header (classic CAN, 8 bytes)
-  TxHeader.Identifier = 0x123;
-  TxHeader.IdType = FDCAN_STANDARD_ID;
-  TxHeader.TxFrameType = FDCAN_DATA_FRAME;
-  TxHeader.DataLength = FDCAN_DLC_BYTES_8;
-  TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-  TxHeader.BitRateSwitch = FDCAN_BRS_OFF;     // classic
-  TxHeader.FDFormat = FDCAN_CLASSIC_CAN;      // classic
-  TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-  TxHeader.MessageMarker = 0;
-
-  */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -341,9 +322,171 @@ int main(void)
   while (1)
   {
 
-	  /* UART TX for target battery voltage setting */
-	  // float target_voltage = (float) get_var_target_battery_voltage();
-	  // uart_send_voltage(target_voltage);
+	  switch(charger_state) // Charger state machine
+	  {
+	      case CHARGER_IDLE_NC_BAT:
+
+	    	  // Status widget
+	          lv_label_set_text(objects.status_label,
+	                            "IDLE");
+	          lv_label_set_text(objects.detailed_status_label,
+								"Battery not connected");
+	          lv_obj_set_style_bg_color(objects.status_container,
+	                                    lv_color_hex(0x464646),
+	                                    0);
+
+	          // Parameters widget (unlocked)
+	          lv_label_set_text(objects.parameters_label,
+								"Parameters");
+
+	          // Bottom left stats widget
+	          lv_label_set_text(objects.bottom_left_stat_desc,
+								"Battery Voltage");
+	          lv_label_set_text(objects.main_menu_voltage_label,
+								get_var_voltage_text(battery_v));
+	          lv_label_set_text(objects.main_menu_current_label,
+								"");
+
+	          // Set parameters button (unlocked)
+	          lv_obj_remove_state(objects.set_parameters_button, LV_STATE_DISABLED);
+
+	          break;
+
+	      case CHARGER_IDLE_C_BAT:
+
+	    	  // Status widget
+	      	  lv_label_set_text(objects.status_label,
+								"IDLE");
+	      	  lv_label_set_text(objects.detailed_status_label,
+								"Battery connected");
+	      	  lv_obj_set_style_bg_color(objects.status_container,
+										lv_color_hex(0x464646),
+										0);
+
+	      	  // Parameters widget (unlocked)
+	      	  lv_label_set_text(objects.parameters_label,
+								"Parameters");
+
+	      	  // Bottom left stats widget
+	      	  lv_label_set_text(objects.bottom_left_stat_desc,
+								"Battery Voltage");
+	      	  lv_label_set_text(objects.main_menu_voltage_label,
+								get_var_voltage_text(battery_v));
+			  lv_label_set_text(objects.main_menu_current_label,
+								"");
+
+	      	  // Set parameters button (unlocked)
+	      	  lv_obj_remove_state(objects.set_parameters_button, LV_STATE_DISABLED);
+	      	  lv_label_set_text(objects.set_parameters_label,
+								"Set\nParameters");
+
+			  break;
+
+	      case CHARGER_PRECHARGE:
+
+	    	  // Status widget
+	          lv_label_set_text(objects.status_label,
+	                            "PRE-CHARGE");
+	          lv_label_set_text(objects.detailed_status_label,
+								"Battery connected");
+	          lv_obj_set_style_bg_color(objects.status_container,
+	                                    lv_color_hex(0xFF8C00),
+	                                    0);
+
+	          // Parameters widget (locked)
+	          lv_label_set_text(objects.parameters_label,
+								"Parameters\n(locked)");
+	          if(lv_screen_active() == objects.set_parameters_1 || lv_screen_active() == objects.set_parameters_2)
+	          {
+	              lv_screen_load(objects.main_menu); // Kicks user out of settings if state changes while in settings
+	          }
+
+	          // Bottom left stats widget
+	          lv_label_set_text(objects.bottom_left_stat_desc,
+								"Battery Voltage");
+	          lv_label_set_text(objects.main_menu_voltage_label,
+								get_var_voltage_text(battery_v));
+			  lv_label_set_text(objects.main_menu_current_label,
+								"");
+
+	          // Set parameters button (locked)
+			  lv_obj_add_state(objects.set_parameters_button, LV_STATE_DISABLED);
+			  lv_label_set_text(objects.set_parameters_label,
+								"Parameters\nlocked");
+
+	          break;
+
+	      case CHARGER_CHARGING:
+
+	    	  // Status widget
+	          lv_label_set_text(objects.status_label,
+	                            "CHARGING");
+	          lv_label_set_text(objects.detailed_status_label,
+								"Battery connected");
+	          lv_obj_set_style_bg_color(objects.status_container,
+	                                    lv_color_hex(0x008000),
+	                                    0);
+
+	          // Parameters widget (locked)
+	          lv_label_set_text(objects.parameters_label,
+								"Parameters\n(locked)");
+	          if(lv_screen_active() == objects.set_parameters_1 || lv_screen_active() == objects.set_parameters_2)
+	          {
+	              lv_screen_load(objects.main_menu); // Kicks user out of settings if state changes while in settings
+	          }
+
+	          // Bottom left stats widget
+	          lv_label_set_text(objects.bottom_left_stat_desc,
+								"Output");
+	          lv_label_set_text(objects.main_menu_voltage_label,
+								get_var_voltage_text(output_v));
+			  lv_label_set_text(objects.main_menu_current_label,
+					  	  	  	get_var_current_text(output_i));
+
+	          // Set parameters button (locked)
+			  lv_obj_add_state(objects.set_parameters_button, LV_STATE_DISABLED);
+			  lv_label_set_text(objects.set_parameters_label,
+								"Parameters\nlocked");
+
+	          break;
+
+	      case CHARGER_FAULT:
+
+	    	  // Status widget
+	          lv_label_set_text(objects.status_label,
+	                            "FAULT");
+	          lv_label_set_text(objects.detailed_status_label,
+								"Shutdown circuit opened");
+	          lv_obj_set_style_bg_color(objects.status_container,
+	                                    lv_color_hex(0xB40000),
+	                                    0);
+
+	          // Parameters widget (locked)
+	          lv_label_set_text(objects.parameters_label,
+								"Parameters\n(locked)");
+	          if(lv_screen_active() == objects.set_parameters_1 || lv_screen_active() == objects.set_parameters_2)
+	          {
+	              lv_screen_load(objects.main_menu); // Kicks user out of settings if state changes while in settings
+	          }
+
+	          // Bottom left stats widget
+	          lv_label_set_text(objects.bottom_left_stat_desc,
+								"Output");
+	          lv_label_set_text(objects.main_menu_voltage_label,
+								get_var_voltage_text(output_v));
+			  lv_label_set_text(objects.main_menu_current_label,
+								get_var_current_text(output_i));
+
+	          // Set parameters button (locked)
+			  lv_obj_add_state(objects.set_parameters_button, LV_STATE_DISABLED);
+			  lv_label_set_text(objects.set_parameters_label,
+								"Parameters\nlocked");
+
+	          break;
+	  }
+
+	  /* Update debug screen */
+	  update_debug_states();
 
 	  /* Provide updates to currently-displayed Widgets here. */
 	  lv_timer_handler();
@@ -427,16 +570,16 @@ static void MX_FDCAN2_Init(void)
   hfdcan2.Init.AutoRetransmission = DISABLE;
   hfdcan2.Init.TransmitPause = DISABLE;
   hfdcan2.Init.ProtocolException = DISABLE;
-  hfdcan2.Init.NominalPrescaler = 16;
+  hfdcan2.Init.NominalPrescaler = 17;
   hfdcan2.Init.NominalSyncJumpWidth = 1;
-  hfdcan2.Init.NominalTimeSeg1 = 1;
-  hfdcan2.Init.NominalTimeSeg2 = 1;
+  hfdcan2.Init.NominalTimeSeg1 = 15;
+  hfdcan2.Init.NominalTimeSeg2 = 4;
   hfdcan2.Init.DataPrescaler = 1;
   hfdcan2.Init.DataSyncJumpWidth = 1;
   hfdcan2.Init.DataTimeSeg1 = 1;
   hfdcan2.Init.DataTimeSeg2 = 1;
   hfdcan2.Init.StdFiltersNbr = 0;
-  hfdcan2.Init.ExtFiltersNbr = 0;
+  hfdcan2.Init.ExtFiltersNbr = 1;
   hfdcan2.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
   if (HAL_FDCAN_Init(&hfdcan2) != HAL_OK)
   {
@@ -670,9 +813,7 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
 
     active_lv_display = display;
 
-    ili9488_DrawRGBImage(area->x1, area->y1, w, h, (uint16_t *)px_map);
-
-    LCD_IO_Busy = LCD_IO_DmaBusy();
+    ili9488_DrawRGBImage(area->x1, area->y1, w, h, (uint16_t *)px_map); // Use DMA to flush pixels from buffer to display
 
     if(!LCD_IO_DmaBusy()) {
         lv_display_flush_ready(display);
@@ -682,8 +823,6 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
 
 void LCD_IO_DmaTxCpltCallback(SPI_HandleTypeDef *hspi)
 {
-    lcd_dma_done_count++;
-
     if(active_lv_display) {
         lv_display_flush_ready(active_lv_display);
         active_lv_display = NULL;
@@ -718,73 +857,137 @@ void touch_read(lv_indev_t * indev, lv_indev_data_t * data)
     }
 }
 
-// === CAN message RX ===
+// === Live menu updates ===
 
-/*
-static uint8_t dlc_to_len(uint32_t dlc)
+const char * get_var_voltage_text(float v) // Helper for displaying live voltage values
 {
-	switch(dlc) {
-		case FDCAN_DLC_BYTES_0:  return 0;
-	    case FDCAN_DLC_BYTES_1:  return 1;
-	    case FDCAN_DLC_BYTES_2:  return 2;
-	    case FDCAN_DLC_BYTES_3:  return 3;
-	    case FDCAN_DLC_BYTES_4:  return 4;
-	    case FDCAN_DLC_BYTES_5:  return 5;
-	    case FDCAN_DLC_BYTES_6:  return 6;
-	    case FDCAN_DLC_BYTES_7:  return 7;
-	    case FDCAN_DLC_BYTES_8:  return 8;
-	    case FDCAN_DLC_BYTES_12: return 12;
-	    case FDCAN_DLC_BYTES_16: return 16;
-	    case FDCAN_DLC_BYTES_20: return 20;
-	    case FDCAN_DLC_BYTES_24: return 24;
-	    case FDCAN_DLC_BYTES_32: return 32;
-	    case FDCAN_DLC_BYTES_48: return 48;
-	    case FDCAN_DLC_BYTES_64: return 64;
-	    default: return 8;
-	}
+    static char buf[16];
+    snprintf(buf,sizeof(buf),"%.1f V", v);
+    return buf;
 }
 
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+const char * get_var_current_text(float i) // Helper for displaying live current values
 {
-    if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0) return;
-
-    if(HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData_CAN) != HAL_OK)
-        return;
-
-    uint32_t id  = RxHeader.Identifier;
-    uint8_t  len = dlc_to_len(RxHeader.DataLength);
-
-    uint8_t is_ext = (RxHeader.IdType == FDCAN_EXTENDED_ID) ? 1 : 0;
-    uint8_t is_fd  = (RxHeader.FDFormat == FDCAN_FD_CAN) ? 1 : 0;
-
-    send_can(id, is_ext, is_fd, RxData_CAN, len);
-
+    static char buf[16];
+    snprintf(buf,sizeof(buf),"%.3f A", i);
+    return buf;
 }
 
-static void textarea_trim(lv_obj_t * ta)
+const char * get_var_power_text(float p) // Helper for displaying live power values
 {
-    uint32_t max = lv_textarea_get_max_length(ta); // currently at 258, which is the amount of characters to display 6 lines of CAN messages + 1
-    if(max == 0) return;
-
-    const char * txt = lv_textarea_get_text(ta);
-    if(!txt) return;
-
-    size_t len = strlen(txt);
-    if(len < max) return;
-
-    lv_textarea_set_text(ta, "");
+    static char buf[16];
+    snprintf(buf,sizeof(buf),"%.3f kW", p);
+    return buf;
 }
-*/
+
+const char * get_var_temperature_text(float t) // Helper for displaying live temperature values
+{
+    static char buf[16];
+    snprintf(buf,sizeof(buf),"%.1f °C", t);
+    return buf;
+}
+
+void update_debug_states(void)
+{
+	// TODO: Will parse debug status from HV which will be received as a one-hot code of all debug states. Debug states are boolean and can be OK/FAIL or ON/OFF.
+	// TODO: Set thresholds for comms/ display performance and resource usage OK/FAIL
+}
+
+// === CAN message RX, parsing and processing ===
+
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
+                               uint32_t RxFifo0ITs)
+{
+    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != 0)
+    {
+        FDCAN_RxHeaderTypeDef RxHeader;
+        uint8_t RxData[8];
+
+        HAL_FDCAN_GetRxMessage(hfdcan,
+                               FDCAN_RX_FIFO0,
+                               &RxHeader,
+                               RxData);
+
+        // Check if message uses extended ID
+        if (RxHeader.IdType == FDCAN_EXTENDED_ID)
+        {
+            if (RxHeader.Identifier == 0x000000FF)
+            {
+            	log_can_data(RxData);
+            }
+        }
+    }
+}
+
+static void log_can_data(uint8_t *data)
+{
+    uint32_t voltage_bcd = 0;
+    uint32_t current_bcd = 0;
+
+    // Combine 4 bytes each into 32-bit values
+    voltage_bcd =
+        ((uint32_t)data[0] << 24) |
+        ((uint32_t)data[1] << 16) |
+        ((uint32_t)data[2] << 8 ) |
+        ((uint32_t)data[3]);
+
+    current_bcd =
+        ((uint32_t)data[4] << 24) |
+        ((uint32_t)data[5] << 16) |
+        ((uint32_t)data[6] << 8 ) |
+        ((uint32_t)data[7]);
+
+    // Extract BCD digits for voltage
+    uint8_t v_digits[8];
+    uint8_t i_digits[8];
+
+    for(int i = 0; i < 8; i++)
+    {
+        v_digits[i] = (voltage_bcd >> ((7 - i) * 4)) & 0x0F;
+        i_digits[i] = (current_bcd >> ((7 - i) * 4)) & 0x0F;
+
+        // Validate BCD digits
+        if(v_digits[i] > 9 || i_digits[i] > 9)
+            return;
+    }
+
+    // Example format:
+    // Voltage: xxxxx.xx
+    target_v =
+        (float)(
+            v_digits[1] * 10000 +
+            v_digits[2] * 1000  +
+            v_digits[3] * 100   +
+            v_digits[4] * 10    +
+            v_digits[5]
+        )
+        +
+        (float)(
+            v_digits[6] * 10 +
+            v_digits[7]
+        ) / 100.0f;
+
+    // Current: xx.xxxxx
+		target_i =
+		    (float)(
+		        i_digits[0] * 10 +
+		        i_digits[1]
+		    )
+		    +
+		    (float)(
+		        i_digits[2] * 10000 +
+		        i_digits[3] * 1000  +
+		        i_digits[4] * 100   +
+		        i_digits[5] * 10    +
+		        i_digits[6]
+		    ) / 100000.0f;
+}
 
 // === UART Debugging ===
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance != USART1) return;
-
-    g_uart_err_hits++;
-    g_uart_last_err = huart->ErrorCode;
-    g_uart_last_isr = huart->Instance->ISR;
 
     HAL_UART_AbortReceive(huart);
     uart_dma_last_pos = 0;
@@ -866,7 +1069,6 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 	if (huart->Instance == USART1)
 	{
 		uart_rx_process_dma(); // Process received message
-		uart_idle_hits++;
 	}
 }
 
@@ -986,75 +1188,164 @@ static void log_uart_data(const uart_msg_t *m)
 
 // === UART data plotting ===
 
-static void set_voltage_label(float v)
+static void charts_init(void) // LVGL charts can only plot integers. Scaling used for decimals.
 {
-    // 1 decimal place
-    int32_t v10 = (int32_t)(v * 10.0f + (v >= 0 ? 0.5f : -0.5f)); // rounded
-    int32_t whole = v10 / 10;
-    int32_t frac  = v10 % 10;
-    if(frac < 0) frac = -frac;
+    // Output voltage chart
+    lv_obj_t * c_o_v = objects.output_voltage_chart;
+    lv_chart_set_point_count(c_o_v, 120); // last 120 samples on screen
+    lv_chart_set_type(c_o_v, LV_CHART_TYPE_LINE);
+    lv_chart_set_update_mode(c_o_v, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
+    lv_chart_set_axis_range(c_o_v, LV_CHART_AXIS_PRIMARY_Y, 0, 600*10); // volts (scaled by 10 for 1 d.p.)
+    lv_obj_set_style_size(c_o_v, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
+    lv_chart_set_div_line_count(c_o_v, 5+2, 3+2); // Chart grid setting
+    s_o_v = lv_chart_add_series(c_o_v, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
 
-    static char buf[32];
-    snprintf(buf, sizeof(buf), "%ld.%01ld V", (long)whole, (long)frac);
-    lv_label_set_text(objects.output_voltage_label, buf);
-}
+    // Output current chart
+    lv_obj_t * c_o_i = objects.output_current_chart;
+    lv_chart_set_point_count(c_o_i, 120); // last 120 samples on screen
+    lv_chart_set_type(c_o_i, LV_CHART_TYPE_LINE);
+    lv_chart_set_update_mode(c_o_i, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
+    lv_chart_set_axis_range(c_o_i, LV_CHART_AXIS_PRIMARY_Y, 0, 10*1000); // amps (scaled by 1000 for 3 d.p.)
+    lv_obj_set_style_size(c_o_i, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
+    lv_chart_set_div_line_count(c_o_i, 4+2, 3+2); // Chart grid setting
+    s_o_i = lv_chart_add_series(c_o_i, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
 
-static void set_current_label(float i)
-{
-    // 2 decimal places
-    int32_t i100 = (int32_t)(i * 100.0f + (i >= 0 ? 0.5f : -0.5f)); // rounded
-    int32_t whole = i100 / 100;
-    int32_t frac  = i100 % 100;
-    if(frac < 0) frac = -frac;
+    // Output power chart
+	lv_obj_t * c_o_p = objects.output_power_chart;
+	lv_chart_set_point_count(c_o_p, 120); // last 120 samples on screen
+	lv_chart_set_type(c_o_p, LV_CHART_TYPE_LINE);
+	lv_chart_set_update_mode(c_o_p, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
+	lv_chart_set_axis_range(c_o_p, LV_CHART_AXIS_PRIMARY_Y, 0, 10*1000); // kilowatts (scaled by 1000 for 3 d.p.)
+	lv_obj_set_style_size(c_o_p, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
+	lv_chart_set_div_line_count(c_o_p, 3+2, 3+2); // Chart grid setting
+	s_o_p = lv_chart_add_series(c_o_p, lv_palette_main(LV_PALETTE_GREEN), LV_CHART_AXIS_PRIMARY_Y);
 
-    static char buf[32];
-    snprintf(buf, sizeof(buf), "%ld.%02ld A", (long)whole, (long)frac);
-    lv_label_set_text(objects.output_current_label, buf);
-}
+	// Battery voltage chart
+	lv_obj_t * c_b_v = objects.battery_voltage_chart;
+	lv_chart_set_point_count(c_b_v, 120); // last 120 samples on screen
+	lv_chart_set_type(c_b_v, LV_CHART_TYPE_LINE);
+	lv_chart_set_update_mode(c_b_v, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
+	lv_chart_set_axis_range(c_b_v, LV_CHART_AXIS_PRIMARY_Y, 0, 600*10); // volts (scaled by 10 for 1 d.p.)
+	lv_obj_set_style_size(c_b_v, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
+	lv_chart_set_div_line_count(c_b_v, 5+2, 3+2); // Chart grid setting
+	s_b_v = lv_chart_add_series(c_b_v, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
 
-static void charts_init(void)
-{
-    // Voltage chart
-    lv_obj_t * cv = objects.output_voltage_chart;
-    lv_chart_set_type(cv, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(cv, 120); // last 120 samples on screen
-    lv_chart_set_update_mode(cv, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
-    lv_chart_set_axis_range(cv, LV_CHART_AXIS_PRIMARY_Y, 0, 600); // volts
-    s_v = lv_chart_add_series(cv, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
+	// PFC voltage chart
+	lv_obj_t * c_p_v = objects.pfc_voltage_chart;
+	lv_chart_set_point_count(c_p_v, 120); // last 120 samples on screen
+	lv_chart_set_type(c_p_v, LV_CHART_TYPE_LINE);
+	lv_chart_set_update_mode(c_p_v, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
+	lv_chart_set_axis_range(c_p_v, LV_CHART_AXIS_PRIMARY_Y, 0, 600*10); // volts (scaled by 10 for 1 d.p.)
+	lv_obj_set_style_size(c_p_v, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
+	lv_chart_set_div_line_count(c_p_v, 5+2, 3+2); // Chart grid setting
+	s_p_v = lv_chart_add_series(c_p_v, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
 
+	// PFC current chart
+	lv_obj_t * c_p_i = objects.pfc_current_chart;
+	lv_chart_set_point_count(c_p_i, 120); // last 120 samples on screen
+	lv_chart_set_type(c_p_i, LV_CHART_TYPE_LINE);
+	lv_chart_set_update_mode(c_p_i, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
+	lv_chart_set_axis_range(c_p_i, LV_CHART_AXIS_PRIMARY_Y, 0, 10*1000); // amps (scaled by 1000 for 3 d.p.)
+	lv_obj_set_style_size(c_p_i, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
+	lv_chart_set_div_line_count(c_p_i, 4+2, 3+2); // Chart grid setting
+	s_p_i = lv_chart_add_series(c_p_i, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
 
-    // Current chart
-    lv_obj_t * ci = objects.output_current_chart;
-    lv_chart_set_type(ci, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(ci, 120);
-    lv_chart_set_update_mode(ci, LV_CHART_UPDATE_MODE_SHIFT);
-    lv_chart_set_axis_range(ci, LV_CHART_AXIS_PRIMARY_Y, 0, 10); // amps
-    s_i = lv_chart_add_series(ci, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
+	// Temperature 1 chart
+	lv_obj_t * c_t_1 = objects.temperature_chart_1;
+	lv_chart_set_point_count(c_t_1, 120); // last 120 samples on screen
+	lv_chart_set_type(c_t_1, LV_CHART_TYPE_LINE);
+	lv_chart_set_update_mode(c_t_1, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
+	lv_chart_set_axis_range(c_t_1, LV_CHART_AXIS_PRIMARY_Y, 0, 100*10); // degrees celsius (scaled by 10 for 1 d.p.)
+	lv_obj_set_style_size(c_t_1, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
+	lv_chart_set_div_line_count(c_t_1, 4+2, 3+2); // Chart grid setting
+	s_t_1 = lv_chart_add_series(c_t_1, lv_palette_main(LV_PALETTE_BROWN), LV_CHART_AXIS_PRIMARY_Y);
+
+	// Temperature 2 chart
+	lv_obj_t * c_t_2 = objects.temperature_chart_2;
+	lv_chart_set_point_count(c_t_2, 120); // last 120 samples on screen
+	lv_chart_set_type(c_t_2, LV_CHART_TYPE_LINE);
+	lv_chart_set_update_mode(c_t_2, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
+	lv_chart_set_axis_range(c_t_2, LV_CHART_AXIS_PRIMARY_Y, 0, 100*10); // degrees celsius (scaled by 10 for 1 d.p.)
+	lv_obj_set_style_size(c_t_2, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
+	lv_chart_set_div_line_count(c_t_2, 4+2, 3+2); // Chart grid setting
+	s_t_2 = lv_chart_add_series(c_t_2, lv_palette_main(LV_PALETTE_BROWN), LV_CHART_AXIS_PRIMARY_Y);
+
+	// Temperature 3 chart
+	lv_obj_t * c_t_3 = objects.temperature_chart_3;
+	lv_chart_set_point_count(c_t_3, 120); // last 120 samples on screen
+	lv_chart_set_type(c_t_3, LV_CHART_TYPE_LINE);
+	lv_chart_set_update_mode(c_t_3, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
+	lv_chart_set_axis_range(c_t_3, LV_CHART_AXIS_PRIMARY_Y, 0, 100*10); // degrees celsius (scaled by 10 for 1 d.p.)
+	lv_obj_set_style_size(c_t_3, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
+	lv_chart_set_div_line_count(c_t_3, 4+2, 3+2); // Chart grid setting
+	s_t_3 = lv_chart_add_series(c_t_3, lv_palette_main(LV_PALETTE_BROWN), LV_CHART_AXIS_PRIMARY_Y);
 }
 
 static void charts_feed_cb(lv_timer_t * t)
 {
-    (void)t;
+	(void)t;
 
-    static float ts = 0.0f;
-    ts += 0.5f; // 500 ms step as timer also has 500 ms step
+    float o_v = output_v;
+    float o_i = output_i;
+    float o_p = output_p;
+    float b_v = battery_v;
+    float p_v = pfc_v;
+    float p_i = pfc_i;
+    float temperature[3];
+    temperature[0] = temp[0];
+    temperature[1] = temp[1];
+    temperature[2] = temp[2];
 
-    float v = output_v;
-    float i = output_i;
 
     // Clamp to chart ranges
-    if(v < 0) v = 0;
-    if(v > 600) v = 600;
-    if(i < 0) i = 0;
-    if(i > 10) i = 10;
+    if(o_v < 0) o_v = 0;
+    if(o_v > 600) o_v = 600;
+
+    if(o_i < 0) o_i = 0;
+    if(o_i > 10) o_i = 10;
+
+    if(o_p < 0) o_p = 0;
+	if(o_p > 4) o_p = 4;
+
+	if(b_v < 0) b_v = 0;
+	if(b_v > 600) b_v = 600;
+
+	if(p_v < 0) p_v = 0;
+	if(p_v > 600) p_v = 600;
+
+    if(p_i < 0) p_i = 0;
+    if(p_i > 10) p_i = 10;
+
+    for(int k = 0; k < 3; k++) {
+        if(temperature[k] < 0) temperature[k] = 0;
+        if(temperature[k] > 100) temperature[k] = 100;
+    }
 
     // Set chart series
-    lv_chart_set_next_value(objects.output_voltage_chart, s_v, (int32_t)v);
-    lv_chart_set_next_value(objects.output_current_chart, s_i, (int32_t)i);
+	lv_chart_set_next_value(objects.output_voltage_chart, s_o_v, (int32_t)(o_v * 10.0f + 0.5f));
+	lv_chart_set_next_value(objects.output_current_chart, s_o_i, (int32_t)(o_i * 1000.0f + 0.5f));
+	lv_chart_set_next_value(objects.output_power_chart,   s_o_p, (int32_t)(o_p * 1000.0f + 0.5f));
 
-    // Set chart labels
-    set_voltage_label(v);
-    set_current_label(i);
+	lv_chart_set_next_value(objects.battery_voltage_chart, s_b_v, (int32_t)(b_v * 10.0f + 0.5f));
+	lv_chart_set_next_value(objects.pfc_voltage_chart,     s_p_v, (int32_t)(p_v * 10.0f + 0.5f));
+	lv_chart_set_next_value(objects.pfc_current_chart,     s_p_i, (int32_t)(p_i * 1000.0f + 0.5f));
+
+	lv_chart_set_next_value(objects.temperature_chart_1, s_t_1, (int32_t)(temperature[0] * 10.0f + 0.5f));
+	lv_chart_set_next_value(objects.temperature_chart_2, s_t_2, (int32_t)(temperature[1] * 10.0f + 0.5f));
+	lv_chart_set_next_value(objects.temperature_chart_3, s_t_3, (int32_t)(temperature[2] * 10.0f + 0.5f));
+
+	// Set chart labels
+	lv_label_set_text(objects.output_voltage_label, get_var_voltage_text(o_v));
+	lv_label_set_text(objects.output_current_label, get_var_current_text(o_i));
+	lv_label_set_text(objects.output_power_label,   get_var_power_text(o_p));
+
+	lv_label_set_text(objects.battery_voltage_label, get_var_voltage_text(b_v));
+	lv_label_set_text(objects.pfc_voltage_label,     get_var_voltage_text(p_v));
+	lv_label_set_text(objects.pfc_current_label,     get_var_current_text(p_i));
+
+	lv_label_set_text(objects.temperature_label_1, get_var_temperature_text(temperature[0]));
+	lv_label_set_text(objects.temperature_label_2, get_var_temperature_text(temperature[1]));
+	lv_label_set_text(objects.temperature_label_3, get_var_temperature_text(temperature[2]));
 }
 
 void start_charts(void)

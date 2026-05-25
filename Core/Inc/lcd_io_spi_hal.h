@@ -153,6 +153,6 @@ void LCD_IO_DmaRxCpltCallback(SPI_HandleTypeDef *hspi);
 
 /* Pixel buffer size for DMA bitdepth conversion (buffer size [byte] = 3 * pixel buffer size)
    note: if 0 -> does not use DMA for 24-bit drawing and reading */
-#define LCD_RGB24_BUFFSIZE    4096
+#define LCD_RGB24_BUFFSIZE    1024
 
 #endif

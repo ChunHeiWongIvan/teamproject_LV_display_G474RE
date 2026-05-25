@@ -13,13 +13,16 @@ extern "C" {
 // Flow global variables
 
 enum FlowGlobalVariables {
-    FLOW_GLOBAL_VARIABLE_TARGET_BATTERY_VOLTAGE = 0
+    FLOW_GLOBAL_VARIABLE_CONSTANT_VOLTAGE_SETPOINT = 0,
+    FLOW_GLOBAL_VARIABLE_CONSTANT_CURRENT_SETPOINT = 1
 };
 
 // Native global variables
 
-extern int32_t get_var_target_battery_voltage();
-extern void set_var_target_battery_voltage(int32_t value);
+extern float get_var_constant_voltage_setpoint();
+extern void set_var_constant_voltage_setpoint(float value);
+extern float get_var_constant_current_setpoint();
+extern void set_var_constant_current_setpoint(float value);
 
 #ifdef __cplusplus
 }

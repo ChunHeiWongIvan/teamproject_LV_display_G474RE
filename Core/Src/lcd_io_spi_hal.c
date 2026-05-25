@@ -13,15 +13,6 @@
 #include "lcd_io_spi_hal.h"
 
 //-----------------------------------------------------------------------------
-/* DMA Debug.. wtf*/
-
-volatile uint32_t dbg_16to24_enter;
-volatile uint32_t dbg_16to24_dma;
-volatile uint32_t dbg_16to24_no_dma;
-volatile uint32_t dbg_16to24_size;
-volatile uint32_t dbg_16to24_ret;
-
-//-----------------------------------------------------------------------------
 #define  DMA_MINSIZE          0x0010
 #define  DMA_MAXSIZE          0xFFFE
 /* note:
@@ -547,15 +538,11 @@ void LCDWriteFillMultiData8and16(uint8_t * pData, uint32_t Size, uint32_t Mode)
    - Mode: 8 or 16 or 24 bit mode, write or read, fill or multidata (see the LCD_IO_... defines in lcd_io.h file) */
 void LCDWriteFillMultiData16to24(uint8_t * pData, uint32_t Size, uint32_t Mode)
 {
-  dbg_16to24_enter++;
-  dbg_16to24_size = Size;
-
   LcdSpiMode8();
 
   #if LCD_DMA_TX == 1 && LCD_RGB24_BUFFSIZE > 0
   if(Size > DMA_MINSIZE)
   { /* DMA mode */
-	dbg_16to24_dma++;
     LCD_SPI_HANDLE.hdmatx->Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
     LCD_SPI_HANDLE.hdmatx->Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
     LCD_SPI_HANDLE.hdmatx->Init.MemInc = DMA_MINC_ENABLE;
@@ -582,13 +569,12 @@ void LCDWriteFillMultiData16to24(uint8_t * pData, uint32_t Size, uint32_t Mode)
       BitmapConvert16to24((uint16_t *)pData, lcd_rgb24_buffer, dmastatus.trsize);
     }
 
-    dbg_16to24_ret = HAL_SPI_Transmit_DMA(&LCD_SPI_HANDLE, lcd_rgb24_buffer, dmastatus.trsize * 3);
+    HAL_SPI_Transmit_DMA(&LCD_SPI_HANDLE, lcd_rgb24_buffer, dmastatus.trsize * 3);
     LcdDmaWaitEnd(Mode & LCD_IO_MULTIDATA);
   }
   else
   #endif
   { /* not DMA mode */
-	dbg_16to24_no_dma++;
     #if LCD_RGB24_BUFFSIZE == 0
     uint32_t rgb888;
     if(Mode & LCD_IO_FILL)
