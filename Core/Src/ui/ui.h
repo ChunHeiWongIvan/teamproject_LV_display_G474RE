@@ -3,7 +3,7 @@
 
 #include <lvgl.h>
 
-#include "screens.h"
+#include <screens.h>
 
 #ifdef __cplusplus
 extern "C" {

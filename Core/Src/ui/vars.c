@@ -1,5 +1,5 @@
-#include "vars.h"
 #include <stdio.h>
+#include <vars.h>
 
 float constant_voltage_setpoint = 400.0f;
 float constant_current_setpoint = 5.000f;

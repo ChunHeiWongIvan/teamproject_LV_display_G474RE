@@ -1,7 +1,7 @@
-#include "actions.h"
-#include "screens.h"
-#include "vars.h"
-#include "ui.h"
+#include <actions.h>
+#include <screens.h>
+#include <ui.h>
+#include <vars.h>
 
 extern const char * get_var_constant_voltage_setpoint_text(void);
 extern const char * get_var_constant_current_setpoint_text(void);

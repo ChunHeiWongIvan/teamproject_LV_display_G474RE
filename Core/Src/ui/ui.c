@@ -1,10 +1,9 @@
-#include "ui.h"
-#include "screens.h"
-#include "images.h"
-#include "actions.h"
-#include "vars.h"
-
+#include <actions.h>
+#include <images.h>
+#include <screens.h>
 #include <string.h>
+#include <ui.h>
+#include <vars.h>
 
 static int16_t currentScreen = -1;
 

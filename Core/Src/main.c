@@ -30,13 +30,12 @@
 #include "lcd.h"
 
 #include "lvgl.h"
-#include "ui.h"
-
 #include "ui/vars.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <ui.h>
 
 extern void LCD_IO_Init(void);
 
@@ -53,6 +52,7 @@ typedef enum
     CHARGER_CHARGING,
     CHARGER_FAULT
 } charger_state_t; // Charger states: Idle (battery not connected), Idle (battery connected), Pre-Charge, Charging, Fault
+
 
 typedef struct {
     uint16_t id;
@@ -101,7 +101,7 @@ DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
 
-static volatile charger_state_t charger_state = CHARGER_IDLE_NC_BAT; // Initialize charger state at IDLE and not connected to battery
+static volatile charger_state_t charger_state = CHARGER_IDLE_NC_BAT; // Initialise charger state at IDLE battery not connected
 
 static lv_display_t * active_lv_display = NULL; // for SPI DMA screen flush callback
 
@@ -134,6 +134,7 @@ static volatile float pfc_i = 0.0f; // PFC current
 static volatile float temp[3] = {0.0f}; // temperature 1, 2, 3
 
 static lv_timer_t * charts_timer = NULL; // chart exclusive timer
+static float sim_time_s = 0.0f; // DEMO chart simulation time
 
 // UART TX variables
 uint8_t tx_frame[1+2+2+1];
@@ -283,6 +284,7 @@ int main(void)
   /* Chart initialization */
   start_charts();
 
+
   /* UART initialization */
   HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_dma_rx, UART_DMA_RX_SZ); // RX event interrupt called when buffer is full, half full or line is IDLE for 1 byte
 
@@ -343,7 +345,7 @@ int main(void)
 	          lv_label_set_text(objects.bottom_left_stat_desc,
 								"Battery Voltage");
 	          lv_label_set_text(objects.main_menu_voltage_label,
-								get_var_voltage_text(battery_v));
+								"0.0 V"); // DEMO
 	          lv_label_set_text(objects.main_menu_current_label,
 								"");
 
@@ -371,7 +373,7 @@ int main(void)
 	      	  lv_label_set_text(objects.bottom_left_stat_desc,
 								"Battery Voltage");
 	      	  lv_label_set_text(objects.main_menu_voltage_label,
-								get_var_voltage_text(battery_v));
+								"280.0 V"); // Set battery voltage for demo
 			  lv_label_set_text(objects.main_menu_current_label,
 								"");
 
@@ -405,7 +407,7 @@ int main(void)
 	          lv_label_set_text(objects.bottom_left_stat_desc,
 								"Battery Voltage");
 	          lv_label_set_text(objects.main_menu_voltage_label,
-								get_var_voltage_text(battery_v));
+	        		  	  	  	"280.0 V"); // Set battery voltage for DEMO
 			  lv_label_set_text(objects.main_menu_current_label,
 								"");
 
@@ -473,14 +475,15 @@ int main(void)
 	          lv_label_set_text(objects.bottom_left_stat_desc,
 								"Output");
 	          lv_label_set_text(objects.main_menu_voltage_label,
-								get_var_voltage_text(output_v));
+								"0.0 V"); // For DEMO
 			  lv_label_set_text(objects.main_menu_current_label,
-								get_var_current_text(output_i));
+							    "0.000 A"); // For DEMO
 
 	          // Set parameters button (locked)
 			  lv_obj_add_state(objects.set_parameters_button, LV_STATE_DISABLED);
 			  lv_label_set_text(objects.set_parameters_label,
 								"Parameters\nlocked");
+
 
 	          break;
 	  }
@@ -1215,7 +1218,7 @@ static void charts_init(void) // LVGL charts can only plot integers. Scaling use
 	lv_chart_set_point_count(c_o_p, 120); // last 120 samples on screen
 	lv_chart_set_type(c_o_p, LV_CHART_TYPE_LINE);
 	lv_chart_set_update_mode(c_o_p, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
-	lv_chart_set_axis_range(c_o_p, LV_CHART_AXIS_PRIMARY_Y, 0, 10*1000); // kilowatts (scaled by 1000 for 3 d.p.)
+	lv_chart_set_axis_range(c_o_p,LV_CHART_AXIS_PRIMARY_Y, 0, 4 * 1000); // kilowatts (scaled by 1000 for 3 d.p.)
 	lv_obj_set_style_size(c_o_p, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
 	lv_chart_set_div_line_count(c_o_p, 3+2, 3+2); // Chart grid setting
 	s_o_p = lv_chart_add_series(c_o_p, lv_palette_main(LV_PALETTE_GREEN), LV_CHART_AXIS_PRIMARY_Y);
@@ -1281,21 +1284,58 @@ static void charts_init(void) // LVGL charts can only plot integers. Scaling use
 	s_t_3 = lv_chart_add_series(c_t_3, lv_palette_main(LV_PALETTE_BROWN), LV_CHART_AXIS_PRIMARY_Y);
 }
 
-static void charts_feed_cb(lv_timer_t * t)
+static void charts_feed_cb(lv_timer_t * t) // DEMO version charts_feed_cb, simulated data
 {
-	(void)t;
+    (void)t;
 
+    sim_time_s += 0.5f; // timer period = 500 ms
+
+    // --- Simulated charger data ---
+
+    // Output voltage ramp: +20 V/min from 280 V
+    output_v = 280.0f + (20.0f / 60.0f) * sim_time_s;
+
+    if(output_v > 400.0f)
+        output_v = 400.0f;
+
+    // Constant-current phase
+    output_i = 7.5f;
+
+    // Add ±1% ripple, except temperature
+    float r1 = 1.0f + 0.01f * sinf(2.0f * 3.14159f * 0.8f * sim_time_s);
+    float r2 = 1.0f + 0.01f * sinf(2.0f * 3.14159f * 0.6f * sim_time_s + 1.2f);
+    float r3 = 1.0f + 0.01f * sinf(2.0f * 3.14159f * 0.9f * sim_time_s + 2.0f);
+
+    output_v *= r1;
+    output_i *= r2;
+
+    output_p = (output_v * output_i) / 1000.0f; // kW
+
+    if (charger_state != CHARGER_IDLE_NC_BAT)
+    	battery_v = output_v;
+
+    pfc_v = 400.0f * r3;
+
+    // 100% efficiency assumption
+    pfc_i = (output_p * 1000.0f) / pfc_v;
+
+    // Simulated temperatures
+    temp[0] = 25.0f + 0.020f * sim_time_s;
+    temp[1] = 24.0f + 0.015f * sim_time_s;
+    temp[2] = 23.0f + 0.010f * sim_time_s;
+
+    // Copy values locally
     float o_v = output_v;
     float o_i = output_i;
     float o_p = output_p;
     float b_v = battery_v;
     float p_v = pfc_v;
     float p_i = pfc_i;
+
     float temperature[3];
     temperature[0] = temp[0];
     temperature[1] = temp[1];
     temperature[2] = temp[2];
-
 
     // Clamp to chart ranges
     if(o_v < 0) o_v = 0;
@@ -1305,13 +1345,13 @@ static void charts_feed_cb(lv_timer_t * t)
     if(o_i > 10) o_i = 10;
 
     if(o_p < 0) o_p = 0;
-	if(o_p > 4) o_p = 4;
+    if(o_p > 4) o_p = 4;
 
-	if(b_v < 0) b_v = 0;
-	if(b_v > 600) b_v = 600;
+    if(b_v < 0) b_v = 0;
+    if(b_v > 600) b_v = 600;
 
-	if(p_v < 0) p_v = 0;
-	if(p_v > 600) p_v = 600;
+    if(p_v < 0) p_v = 0;
+    if(p_v > 600) p_v = 600;
 
     if(p_i < 0) p_i = 0;
     if(p_i > 10) p_i = 10;
@@ -1322,30 +1362,31 @@ static void charts_feed_cb(lv_timer_t * t)
     }
 
     // Set chart series
-	lv_chart_set_next_value(objects.output_voltage_chart, s_o_v, (int32_t)(o_v * 10.0f + 0.5f));
-	lv_chart_set_next_value(objects.output_current_chart, s_o_i, (int32_t)(o_i * 1000.0f + 0.5f));
-	lv_chart_set_next_value(objects.output_power_chart,   s_o_p, (int32_t)(o_p * 1000.0f + 0.5f));
+    lv_chart_set_next_value(objects.output_voltage_chart, s_o_v, (int32_t)(o_v * 10.0f + 0.5f));
+    lv_chart_set_next_value(objects.output_current_chart, s_o_i, (int32_t)(o_i * 1000.0f + 0.5f));
+    lv_chart_set_next_value(objects.output_power_chart,   s_o_p, (int32_t)(o_p * 1000.0f + 0.5f));
 
-	lv_chart_set_next_value(objects.battery_voltage_chart, s_b_v, (int32_t)(b_v * 10.0f + 0.5f));
-	lv_chart_set_next_value(objects.pfc_voltage_chart,     s_p_v, (int32_t)(p_v * 10.0f + 0.5f));
-	lv_chart_set_next_value(objects.pfc_current_chart,     s_p_i, (int32_t)(p_i * 1000.0f + 0.5f));
+    lv_chart_set_next_value(objects.battery_voltage_chart, s_b_v, (int32_t)(b_v * 10.0f + 0.5f));
+    lv_chart_set_next_value(objects.pfc_voltage_chart,     s_p_v, (int32_t)(p_v * 10.0f + 0.5f));
+    lv_chart_set_next_value(objects.pfc_current_chart,     s_p_i, (int32_t)(p_i * 1000.0f + 0.5f));
 
-	lv_chart_set_next_value(objects.temperature_chart_1, s_t_1, (int32_t)(temperature[0] * 10.0f + 0.5f));
-	lv_chart_set_next_value(objects.temperature_chart_2, s_t_2, (int32_t)(temperature[1] * 10.0f + 0.5f));
-	lv_chart_set_next_value(objects.temperature_chart_3, s_t_3, (int32_t)(temperature[2] * 10.0f + 0.5f));
+    lv_chart_set_next_value(objects.temperature_chart_1, s_t_1, (int32_t)(temperature[0] * 10.0f + 0.5f));
+    lv_chart_set_next_value(objects.temperature_chart_2, s_t_2, (int32_t)(temperature[1] * 10.0f + 0.5f));
+    lv_chart_set_next_value(objects.temperature_chart_3, s_t_3, (int32_t)(temperature[2] * 10.0f + 0.5f));
 
-	// Set chart labels
-	lv_label_set_text(objects.output_voltage_label, get_var_voltage_text(o_v));
-	lv_label_set_text(objects.output_current_label, get_var_current_text(o_i));
-	lv_label_set_text(objects.output_power_label,   get_var_power_text(o_p));
+    // Set chart labels
+    lv_label_set_text(objects.output_voltage_label, get_var_voltage_text(o_v));
+    lv_label_set_text(objects.output_current_label, get_var_current_text(o_i));
+    lv_label_set_text(objects.output_power_label,   get_var_power_text(o_p));
 
-	lv_label_set_text(objects.battery_voltage_label, get_var_voltage_text(b_v));
-	lv_label_set_text(objects.pfc_voltage_label,     get_var_voltage_text(p_v));
-	lv_label_set_text(objects.pfc_current_label,     get_var_current_text(p_i));
+    lv_label_set_text(objects.battery_voltage_label, get_var_voltage_text(b_v));
+    lv_label_set_text(objects.pfc_voltage_label,     get_var_voltage_text(p_v));
+    lv_label_set_text(objects.pfc_current_label,     get_var_current_text(p_i));
 
-	lv_label_set_text(objects.temperature_label_1, get_var_temperature_text(temperature[0]));
-	lv_label_set_text(objects.temperature_label_2, get_var_temperature_text(temperature[1]));
-	lv_label_set_text(objects.temperature_label_3, get_var_temperature_text(temperature[2]));
+    lv_label_set_text(objects.temperature_label_1, get_var_temperature_text(temperature[0]));
+    lv_label_set_text(objects.temperature_label_2, get_var_temperature_text(temperature[1]));
+    lv_label_set_text(objects.temperature_label_3, get_var_temperature_text(temperature[2]));
+
 }
 
 void start_charts(void)

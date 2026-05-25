@@ -1,14 +1,13 @@
+#include <actions.h>
+#include <fonts.h>
+#include <images.h>
+#include <screens.h>
 #include <string.h>
 
-#include "screens.h"
-#include "images.h"
-#include "fonts.h"
-#include "actions.h"
-#include "vars.h"
-#include "styles.h"
-#include "ui.h"
-
 #include <string.h>
+#include <styles.h>
+#include <ui.h>
+#include <vars.h>
 
 objects_t objects;
 
