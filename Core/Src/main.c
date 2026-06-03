@@ -77,6 +77,8 @@ typedef struct {
 #define RESOLUTION_VERTICAL 320
 #define BYTES_PER_PIXEL 2
 
+#define BUTTON_DEBOUNCE_PERIOD 2500 // 2.5 second debounce for start/stop button
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -123,6 +125,9 @@ static volatile float temp[3] = {0.0f}; // temperature 1, 2, 3
 
 static lv_timer_t * charts_timer = NULL; // chart exclusive timer
 
+volatile uint8_t buttonPressed = 0; // button detection
+volatile uint32_t lastButtonInterrupt = 0; // button debounce
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -148,13 +153,13 @@ static void log_can_data(uint8_t *data);
 // === UART Debugging ===
 static uint8_t xor_crc(const uint8_t *p, uint16_t n);
 
-// === UART initalization ==
-void uart_parseRxFrame(uint8_t* buffer, uint32_t len);
-
 // === UART data plotting ===
 static void charts_init(void);
 static void charts_feed_cb(lv_timer_t * t);
 void start_charts(void);
+
+// === Button detection and debounce ===
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin);
 
 /* USER CODE END PFP */
 
@@ -227,10 +232,11 @@ int main(void)
   /* LVGL display initialization */
   lv_display_t * display = lv_display_create(RESOLUTION_HORIZONTAL, RESOLUTION_VERTICAL);
 
-  /* LVGL will render to two 1/16 screen sized buffers for 2 bytes/pixel */
+  /* LVGL will render to two 1/16
+   *  screen sized buffers for 2 bytes/pixel */
   /* One buffer flushes via DMA while the other renders in parallel */
-  static uint8_t buf1[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 16 * BYTES_PER_PIXEL];
-  static uint8_t buf2[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 16 * BYTES_PER_PIXEL];
+  static uint8_t buf1[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 20 * BYTES_PER_PIXEL];
+  static uint8_t buf2[RESOLUTION_HORIZONTAL * RESOLUTION_VERTICAL / 20 * BYTES_PER_PIXEL];
   lv_display_set_buffers(display, buf1, buf2, sizeof(buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
 
   /* Displays rendered image */
@@ -285,10 +291,24 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      printfDma("V %3.0f\n",
-                get_var_constant_voltage_setpoint()); // Send CV setpoint
-      printfDma("I %3.2f\n",
-                get_var_constant_current_setpoint()); // Send CC setpoint
+      if (buttonPressed)
+      {
+          buttonPressed = 0;
+          printfDma("\\V %3.0f\n",
+                   get_var_constant_voltage_setpoint()); // Send CV setpoint
+          printfDma("\\C %3.2f\n",
+                   get_var_constant_current_setpoint()); // Send CC setpoint
+          printfDma("\\S\n");
+
+          if (charger_state == CHARGER_IDLE_NC_BAT)
+          {
+              charger_state = CHARGER_CHARGING;
+          } else if (charger_state == CHARGER_CHARGING)
+          {
+              charger_state = CHARGER_IDLE_NC_BAT;
+          }
+
+      }
 
 	  switch(charger_state) // Charger state machine
 	  {
@@ -711,15 +731,6 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len)
 {
     // LV MCU UART Example with sscanf:
 
-    static float PFCVoltage;
-    static float OutputVoltage;
-    static float OutputCurrent;
-    static float BatteryVoltage;
-    static float OutputPower;
-    static float temp1;
-    static float temp2;
-    static float temp3;
-
     if (sscanf((char *)buffer, "VI:%7f, VO:%7f, IO:%7f, VB:%7f, PO:%9f, T1:%7f, T2:%7f, T3:%7f\n",
            &PFCVoltage,
            &OutputVoltage,
@@ -901,6 +912,23 @@ void start_charts(void)
     if(charts_timer == NULL) {
         charts_timer = lv_timer_create(charts_feed_cb, 500, NULL); // 500 ms timer for updating charts
     }
+}
+
+// === Button detection and debounce ===
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_3)
+    {
+        uint32_t now = HAL_GetTick();
+
+        if ((now - lastButtonInterrupt) > BUTTON_DEBOUNCE_PERIOD)
+        {
+            lastButtonInterrupt = now;
+            buttonPressed = 1;
+        }
+    }
+
 }
 
 /* USER CODE END 4 */

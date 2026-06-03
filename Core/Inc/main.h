@@ -53,10 +53,13 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+void uart_parseRxFrame(uint8_t* buffer, uint32_t len);
 
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define START_STOP_Pin GPIO_PIN_3
+#define START_STOP_GPIO_Port GPIOA
 #define LCD_SCK_Pin GPIO_PIN_5
 #define LCD_SCK_GPIO_Port GPIOA
 #define LCD_MISO_Pin GPIO_PIN_6

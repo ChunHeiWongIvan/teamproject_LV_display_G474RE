@@ -9,7 +9,7 @@
 #define uartHandle huart1
 
 #define UART_RX_BUF_SZ 1024   // UART circular DMA RX buffer size
-#define UART_TX_BUF_SZ 10000
+#define UART_TX_BUF_SZ 512
 
 #include "charger_uart.h"
 #include "stdio.h"
