@@ -160,6 +160,7 @@ void start_charts(void);
 
 // === Button detection and debounce ===
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin);
+volatile uint32_t button_callback_called = 0;
 
 /* USER CODE END PFP */
 
@@ -918,6 +919,7 @@ void start_charts(void)
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
+	button_callback_called += 1;
     if (GPIO_Pin == GPIO_PIN_3)
     {
         uint32_t now = HAL_GetTick();
@@ -930,6 +932,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     }
 
 }
+
 
 /* USER CODE END 4 */
 
