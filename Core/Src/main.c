@@ -332,20 +332,9 @@ int main(void)
 	  if (buttonPressed)
 	  {
 	      buttonPressed = 0;
-
-	      if (charger_state == CHARGER_IDLE_C_BAT ||
-              charger_state == CHARGER_IDLE_NC_BAT) // only send CC/CV setpoint when starting charging
-	      {
-	          printfDma("\\V %3.0f\n", get_var_constant_voltage_setpoint());
-	          printfDma("\\C %3.2f\n", get_var_constant_current_setpoint());
-	      }
-
-	      if (charger_state == CHARGER_IDLE_NC_BAT ||
-              charger_state == CHARGER_IDLE_C_BAT ||
-	          charger_state == CHARGER_CHARGING) // toggles charging to start or stop
-	      {
-	          printfDma("\\S\n");
-	      }
+		  printfDma("\\V %3.0f\n", get_var_constant_voltage_setpoint());
+		  printfDma("\\C %3.2f\n", get_var_constant_current_setpoint());
+		  printfDma("\\S\n");
 	  }
 
 	  /* Update debug screen */
