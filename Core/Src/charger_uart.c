@@ -28,13 +28,13 @@ typedef enum {
 static const uint8_t BYTE_START = '\\';
 static const uint8_t BYTE_STOP  = '\n';
 
-volatile uint32_t rxframe_tail = 0;
-volatile uint32_t rxframe_len = 0;
+volatile uint16_t rxframe_tail = 0;
+volatile uint16_t rxframe_len = 0;
 
 uint8_t rxbuffer[UART_RX_BUF_SZ];
 uint8_t rxframebuf[UART_RX_BUF_SZ];
 
-RxState rxState = STATE_WAITING_FOR_START;
+volatile RxState rxState = STATE_WAITING_FOR_START;
 
 
 void uart_init(void){
@@ -43,12 +43,14 @@ void uart_init(void){
 
 
 volatile uint32_t uart_rx_hits;
+volatile uint16_t testsize;
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size){
 
     if (huart == &uartHandle)
     {
         uart_rx_hits++;
+        testsize = Size;
 
         while (Size != rxframe_tail)
         {
@@ -97,6 +99,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size){
 
             if (rxframe_tail >= UART_RX_BUF_SZ){
                 rxframe_tail = 0;
+                if (Size == UART_RX_BUF_SZ)
+                {
+                    break;
+                }
             }
         }
     }

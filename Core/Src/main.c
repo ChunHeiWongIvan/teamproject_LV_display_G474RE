@@ -79,7 +79,7 @@ typedef struct {
 #define RESOLUTION_VERTICAL 320
 #define BYTES_PER_PIXEL 2
 
-#define BUTTON_DEBOUNCE_PERIOD 2500 // 2.5 second debounce for start/stop button
+#define BUTTON_DEBOUNCE_PERIOD 750 // 2.5 second debounce for start/stop button
 
 // Error code definitions for bitmask
 #define ERR_VIN_LOW     0x01
@@ -333,13 +333,15 @@ int main(void)
 	  {
 	      buttonPressed = 0;
 
-	      if (charger_state == CHARGER_IDLE_C_BAT) // only send CC/CV setpoint when starting charging
+	      if (charger_state == CHARGER_IDLE_C_BAT ||
+              charger_state == CHARGER_IDLE_NC_BAT) // only send CC/CV setpoint when starting charging
 	      {
 	          printfDma("\\V %3.0f\n", get_var_constant_voltage_setpoint());
 	          printfDma("\\C %3.2f\n", get_var_constant_current_setpoint());
 	      }
 
-	      if (charger_state == CHARGER_IDLE_C_BAT ||
+	      if (charger_state == CHARGER_IDLE_NC_BAT ||
+              charger_state == CHARGER_IDLE_C_BAT ||
 	          charger_state == CHARGER_CHARGING) // toggles charging to start or stop
 	      {
 	          printfDma("\\S\n");
@@ -888,8 +890,6 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len)
     {
         charger_state = (charger_state_t)state_tmp;
         charger_errorCode = (uint8_t)err_tmp;
-
-        printfDma("\\ Received\n");
     }
 }
 
