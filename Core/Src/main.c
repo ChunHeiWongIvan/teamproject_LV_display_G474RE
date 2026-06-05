@@ -59,7 +59,9 @@ typedef enum
 	CHARGER_IDLE_C_BAT,
     CHARGER_PRECHARGE,
     CHARGER_CHARGING,
-    CHARGER_FAULT
+	CHARGER_SHUTDOWN,
+    CHARGER_FAULT,
+	CHARGER_STATE_TOTAL
 } charger_state_t; // Charger states: Idle (battery not connected), Idle (battery connected), Pre-Charge, Charging, Fault
 
 typedef struct {
@@ -79,6 +81,22 @@ typedef struct {
 
 #define BUTTON_DEBOUNCE_PERIOD 2500 // 2.5 second debounce for start/stop button
 
+// Error code definitions for bitmask
+#define ERR_VIN_LOW     0x01
+#define ERR_OVERCURRENT 0x02
+#define ERR_OVERVOLTAGE 0x04
+#define ERR_OVERPOWER   0x08
+#define ERR_OVERTEMP    0x10
+
+// Debug screen text update
+#define OK_TEXT    "#00FF00 OK#"
+#define FAIL_TEXT "#FF0000 FAIL#"
+
+// For updating CV/CC labels from CAN
+#define V_MIN 0.0f
+#define V_MAX 600.0f
+#define I_MIN 0.0f
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -91,15 +109,19 @@ typedef struct {
 /* USER CODE BEGIN PV */
 
 static volatile charger_state_t charger_state = CHARGER_IDLE_NC_BAT; // Initialize charger state at IDLE and not connected to battery
+static volatile uint8_t charger_errorCode = 0x00; // Initialise charger with no debug errors
+static volatile uint8_t uart_counter = 0; // Updates every 100 ms, if nothing then UART fail
+static volatile uint8_t can_counter = 0; // Updates every 100 ms, if nothing then CAN fail
 
 static lv_display_t * active_lv_display = NULL; // for SPI DMA screen flush callback
 
 static GT911_Object_t gt911; // GT911 touch screen controller
 
-// Variables for storing target voltage/ current received via CAN
+// Variables for storing target voltage/ current and error received via CAN
 static volatile float target_v = 0.0f;
 static volatile float target_i = 0.0f;
-
+static volatile uint16_t BMS_error_code = 0x0000;
+volatile uint8_t can_setpoint_update_pending = 0; // In order to not update labels inside CAN RX ISR
 
 // Charts and variables for storing voltage/ current measurements received via UART
 static lv_chart_series_t * s_o_v = NULL; // output voltage chart
@@ -109,7 +131,6 @@ static lv_chart_series_t * s_o_p = NULL; // output power chart
 static lv_chart_series_t * s_b_v = NULL; // battery voltage chart
 
 static lv_chart_series_t * s_p_v = NULL; // PFC voltage chart
-static lv_chart_series_t * s_p_i = NULL; // PFC current chart
 
 static lv_chart_series_t * s_t_1 = NULL; // temperature 1 chart
 static lv_chart_series_t * s_t_2 = NULL; // temperature 2 chart
@@ -120,13 +141,16 @@ static volatile float OutputCurrent = 0.0f; // output current
 static volatile float OutputPower = 0.0f; // output power
 static volatile float BatteryVoltage = 0.0f; // battery voltage
 static volatile float PFCVoltage = 0.0f; // PFC voltage
-static volatile float pfc_i = 0.0f; // PFC current
 static volatile float temp[3] = {0.0f}; // temperature 1, 2, 3
 
 static lv_timer_t * charts_timer = NULL; // chart exclusive timer
+static lv_timer_t * status_timer = NULL;
+static lv_timer_t * uart_timer = NULL;
+static lv_timer_t * can_timer = NULL;
 
 volatile uint8_t buttonPressed = 0; // button detection
 volatile uint32_t lastButtonInterrupt = 0; // button debounce
+
 
 /* USER CODE END PV */
 
@@ -144,14 +168,20 @@ const char * get_var_voltage_text(float v);
 const char * get_var_current_text(float i);
 const char * get_var_power_text(float p);
 const char * get_var_temperature_text(float t);
-void update_debug_states(void);
+static void increment_uart_timer(lv_timer_t * t);
+static void increment_can_timer(lv_timer_t * t);
+static void update_error_labels(uint8_t errorCode);
+extern const char * get_var_constant_voltage_setpoint_text(void);
+extern const char * get_var_constant_current_setpoint_text(void);
 
 // === CAN message RX, parsing and processing ===
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs);
 static void log_can_data(uint8_t *data);
-
-// === UART Debugging ===
-static uint8_t xor_crc(const uint8_t *p, uint16_t n);
+static void update_setpoints_from_can(float voltage, float current);
+extern float clamp_float(float x, float lo, float hi);
+extern int32_t voltage_to_bar(int32_t v, int32_t MIN, int32_t MAX);
+extern float current_to_bar(float i, float MIN, float MAX);
+extern float get_current_max_for_voltage(float voltage);
 
 // === UART data plotting ===
 static void charts_init(void);
@@ -160,7 +190,9 @@ void start_charts(void);
 
 // === Button detection and debounce ===
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin);
-volatile uint32_t button_callback_called = 0;
+
+// === Status/ fault update to HV ===
+static void LV_status_share(lv_timer_t * t);
 
 /* USER CODE END PFP */
 
@@ -257,8 +289,13 @@ int main(void)
   /* Chart initialization */
   start_charts();
 
+  /* Timers initalization */
+  status_timer = lv_timer_create(LV_status_share, 100, NULL);
+  uart_timer   = lv_timer_create(increment_uart_timer, 100, NULL);
+  can_timer    = lv_timer_create(increment_can_timer, 100, NULL);
+
   /* CAN initialization */
-  // 1) Configure filter: accept ALL standard IDs into RX FIFO0
+  // 1) Configure filter: accept ALL extended IDs into RX FIFO0
   FDCAN_FilterTypeDef sFilter;
   sFilter.IdType = FDCAN_EXTENDED_ID;
   sFilter.FilterIndex = 0;
@@ -292,23 +329,30 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      if (buttonPressed)
+	  if (buttonPressed)
+	  {
+	      buttonPressed = 0;
+
+	      if (charger_state == CHARGER_IDLE_C_BAT) // only send CC/CV setpoint when starting charging
+	      {
+	          printfDma("\\V %3.0f\n", get_var_constant_voltage_setpoint());
+	          printfDma("\\C %3.2f\n", get_var_constant_current_setpoint());
+	      }
+
+	      if (charger_state == CHARGER_IDLE_C_BAT ||
+	          charger_state == CHARGER_CHARGING) // toggles charging to start or stop
+	      {
+	          printfDma("\\S\n");
+	      }
+	  }
+
+	  /* Update debug screen */
+      update_error_labels(charger_errorCode);
+
+      if(can_setpoint_update_pending)
       {
-          buttonPressed = 0;
-          printfDma("\\V %3.0f\n",
-                   get_var_constant_voltage_setpoint()); // Send CV setpoint
-          printfDma("\\C %3.2f\n",
-                   get_var_constant_current_setpoint()); // Send CC setpoint
-          printfDma("\\S\n");
-
-          if (charger_state == CHARGER_IDLE_NC_BAT)
-          {
-              charger_state = CHARGER_CHARGING;
-          } else if (charger_state == CHARGER_CHARGING)
-          {
-              charger_state = CHARGER_IDLE_NC_BAT;
-          }
-
+          can_setpoint_update_pending = 0;
+          update_setpoints_from_can(target_v, target_i);
       }
 
 	  switch(charger_state) // Charger state machine
@@ -439,6 +483,11 @@ int main(void)
 
 	          break;
 
+	      case CHARGER_SHUTDOWN:
+	    	  charger_state = CHARGER_IDLE_C_BAT;
+
+	    	  break;
+
 	      case CHARGER_FAULT:
 
 	    	  // Status widget
@@ -471,11 +520,12 @@ int main(void)
 			  lv_label_set_text(objects.set_parameters_label,
 								"Parameters\nlocked");
 
-	          break;
-	  }
+			  break;
 
-	  /* Update debug screen */
-	  update_debug_states();
+	      	default:
+	      	  break;
+
+	  }
 
 	  /* Provide updates to currently-displayed Widgets here. */
 	  lv_timer_handler();
@@ -621,10 +671,55 @@ const char * get_var_temperature_text(float t) // Helper for displaying live tem
     return buf;
 }
 
-void update_debug_states(void)
+static void increment_can_timer(lv_timer_t * t)
 {
-	// TODO: Will parse debug status from HV which will be received as a one-hot code of all debug states. Debug states are boolean and can be OK/FAIL or ON/OFF.
-	// TODO: Set thresholds for comms/ display performance and resource usage OK/FAIL
+    (void)t;
+    if(can_counter < 255)
+        can_counter++;
+}
+
+static void increment_uart_timer(lv_timer_t * t)
+{
+    (void)t;
+    if(uart_counter < 255)
+        uart_counter++;
+}
+
+static void update_error_labels(uint8_t errorCode) // Helper for updating debug menu
+{
+    char hv_text[64];
+    char overall_text[32];
+    char input_text[32];
+    char lv_text[64];
+
+    snprintf(hv_text, sizeof(hv_text),
+             "%s\n%s\n%s",
+             (errorCode & ERR_OVERVOLTAGE) ? FAIL_TEXT : OK_TEXT,
+             (errorCode & ERR_OVERCURRENT) ? FAIL_TEXT : OK_TEXT,
+             (errorCode & ERR_OVERPOWER)   ? FAIL_TEXT : OK_TEXT);
+
+    snprintf(overall_text, sizeof(overall_text),
+             "%s",
+             (errorCode & ERR_OVERTEMP) ? FAIL_TEXT : OK_TEXT);
+
+    snprintf(input_text, sizeof(input_text),
+             "%s",
+             (errorCode & ERR_VIN_LOW) ? FAIL_TEXT : OK_TEXT);
+
+    snprintf(lv_text, sizeof(lv_text),
+            "%s\n%s",
+            (uart_counter > 10) ? FAIL_TEXT : OK_TEXT,
+            (can_counter > 10)  ? FAIL_TEXT : OK_TEXT);
+
+    lv_label_set_recolor(objects.hv_states, true);
+    lv_label_set_recolor(objects.overall_states, true);
+    lv_label_set_recolor(objects.input_states, true);
+    lv_label_set_recolor(objects.lv_states, true);
+
+    lv_label_set_text(objects.hv_states, hv_text);
+    lv_label_set_text(objects.overall_states, overall_text);
+    lv_label_set_text(objects.input_states, input_text);
+    lv_label_set_text(objects.lv_states, lv_text);
 }
 
 // === CAN message RX, parsing and processing ===
@@ -647,7 +742,9 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
         {
             if (RxHeader.Identifier == 0x000000FF)
             {
+                can_counter = 0;
             	log_can_data(RxData);
+            	can_setpoint_update_pending = 1;
             }
         }
     }
@@ -658,90 +755,141 @@ static void log_can_data(uint8_t *data)
     uint32_t voltage_bcd = 0;
     uint32_t current_bcd = 0;
 
-    // Combine 4 bytes each into 32-bit values
     voltage_bcd =
-        ((uint32_t)data[0] << 24) |
-        ((uint32_t)data[1] << 16) |
-        ((uint32_t)data[2] << 8 ) |
-        ((uint32_t)data[3]);
+        ((uint32_t)data[0] << 16) |
+        ((uint32_t)data[1] << 8 ) |
+        ((uint32_t)data[2]);
 
     current_bcd =
-        ((uint32_t)data[4] << 24) |
-        ((uint32_t)data[5] << 16) |
-        ((uint32_t)data[6] << 8 ) |
-        ((uint32_t)data[7]);
+        ((uint32_t)data[3] << 16) |
+        ((uint32_t)data[4] << 8 ) |
+        ((uint32_t)data[5]);
 
-    // Extract BCD digits for voltage
-    uint8_t v_digits[8];
-    uint8_t i_digits[8];
+    BMS_error_code =
+        ((uint16_t)data[6] << 8) |
+        ((uint16_t)data[7]);
 
-    for(int i = 0; i < 8; i++)
+    uint8_t v_digits[6];
+    uint8_t i_digits[6];
+
+    for (int i = 0; i < 6; i++)
     {
-        v_digits[i] = (voltage_bcd >> ((7 - i) * 4)) & 0x0F;
-        i_digits[i] = (current_bcd >> ((7 - i) * 4)) & 0x0F;
+        v_digits[i] = (voltage_bcd >> ((5 - i) * 4)) & 0x0F;
+        i_digits[i] = (current_bcd >> ((5 - i) * 4)) & 0x0F;
 
-        // Validate BCD digits
-        if(v_digits[i] > 9 || i_digits[i] > 9)
+        if (v_digits[i] > 9 || i_digits[i] > 9)
             return;
     }
 
-    // Example format:
-    // Voltage: xxxxx.xx
+    // Voltage format: xxx.xxx
     target_v =
         (float)(
-            v_digits[1] * 10000 +
-            v_digits[2] * 1000  +
-            v_digits[3] * 100   +
-            v_digits[4] * 10    +
-            v_digits[5]
+            v_digits[0] * 100 +
+            v_digits[1] * 10  +
+            v_digits[2]
         )
         +
         (float)(
-            v_digits[6] * 10 +
-            v_digits[7]
-        ) / 100.0f;
+            v_digits[3] * 100 +
+            v_digits[4] * 10  +
+            v_digits[5]
+        ) / 1000.0f;
 
-    // Current: xx.xxxxx
-		target_i =
-		    (float)(
-		        i_digits[0] * 10 +
-		        i_digits[1]
-		    )
-		    +
-		    (float)(
-		        i_digits[2] * 10000 +
-		        i_digits[3] * 1000  +
-		        i_digits[4] * 100   +
-		        i_digits[5] * 10    +
-		        i_digits[6]
-		    ) / 100000.0f;
+    // Current format: x.xxxxx
+    target_i =
+        (float)i_digits[0]
+        +
+        (float)(
+            i_digits[1] * 10000 +
+            i_digits[2] * 1000  +
+            i_digits[3] * 100   +
+            i_digits[4] * 10    +
+            i_digits[5]
+        ) / 100000.0f;
 }
 
-// === UART Debugging ===
+void update_setpoints_from_can(float voltage, float current) {
+    
+    // Reduce precision first
+    voltage = roundf(voltage * 10.0f) / 10.0f;        // xxx.x
+    current = roundf(current * 1000.0f) / 1000.0f;    // x.xxx
 
-static uint8_t xor_crc(const uint8_t *p, uint16_t n)
-{
-	uint8_t c = 0;
-	for(uint16_t i=0;i<n;i++) c ^= p[i];
-	return c;
+    // Clamp voltage before setting
+    voltage = clamp_float(voltage, V_MIN, V_MAX);
+
+    set_var_constant_voltage_setpoint(voltage);
+
+    // Update voltage labels
+    lv_label_set_text(objects.constant_voltage_setpoint_label,
+                      get_var_constant_voltage_setpoint_text());
+    lv_label_set_text(objects.main_menu_cv_label,
+                      get_var_constant_voltage_setpoint_text());
+    lv_label_set_text(objects.constant_voltage_setpoint_label_1,
+                      get_var_constant_voltage_setpoint_text());
+
+    // Update voltage bars
+    lv_bar_set_value(objects.constant_voltage_setpoint_bar,
+                     voltage_to_bar(voltage, V_MIN, V_MAX),
+                     LV_ANIM_ON);
+    lv_bar_set_value(objects.constant_voltage_setpoint_bar_1,
+                     voltage_to_bar(voltage, V_MIN, V_MAX),
+                     LV_ANIM_ON);
+
+    // Current max may depend on voltage
+    float I_MAX = get_current_max_for_voltage(voltage);
+
+    // Clamp current before setting
+    current = clamp_float(current, I_MIN, I_MAX);
+
+    set_var_constant_current_setpoint(current);
+
+    // Update current labels
+    lv_label_set_text(objects.constant_current_setpoint_label,
+                      get_var_constant_current_setpoint_text());
+    lv_label_set_text(objects.main_menu_cc_label,
+                      get_var_constant_current_setpoint_text());
+    lv_label_set_text(objects.constant_current_setpoint_label_1,
+                      get_var_constant_current_setpoint_text());
+
+    // Update current bars
+    lv_bar_set_value(objects.constant_current_setpoint_bar,
+                     current_to_bar(current, I_MIN, I_MAX),
+                     LV_ANIM_ON);
+    lv_bar_set_value(objects.constant_current_setpoint_bar_1,
+                     current_to_bar(current, I_MIN, I_MAX),
+                     LV_ANIM_ON);
 }
+
+
 
 // === UART Initialization ===
 
 void uart_parseRxFrame(uint8_t* buffer, uint32_t len)
 {
-    // LV MCU UART Example with sscanf:
+    (void)len;
 
-    if (sscanf((char *)buffer, "VI:%7f, VO:%7f, IO:%7f, VB:%7f, PO:%9f, T1:%7f, T2:%7f, T3:%7f\n",
-           &PFCVoltage,
-           &OutputVoltage,
-           &OutputCurrent,
-           &BatteryVoltage,
-           &OutputPower,
-           &temp[0],
-           &temp[1],
-           &temp[2]) == 8){
-        printfDma("// Recieved\n"); // Not recommended to call printfDma in ISR
+    uart_counter = 0;
+
+    int state_tmp;
+    unsigned int err_tmp;
+
+    if (sscanf((char *)buffer,
+               "VI:%7f, VO:%7f, IO:%7f, VB:%7f, PO:%9f, T1:%7f, T2:%7f, T3:%7f, ST:%1d, ER:%02x\n",
+               &PFCVoltage,
+               &OutputVoltage,
+               &OutputCurrent,
+               &BatteryVoltage,
+               &OutputPower,
+               &temp[0],
+               &temp[1],
+               &temp[2],
+               &state_tmp,
+               &err_tmp) == 10)
+    {
+        charger_state = (charger_state_t)state_tmp;
+        charger_errorCode = (uint8_t)err_tmp;
+
+        printfDma("\\ Received\n");
     }
 }
 
@@ -799,16 +947,6 @@ static void charts_init(void) // LVGL charts can only plot integers. Scaling use
 	lv_chart_set_div_line_count(c_p_v, 5+2, 3+2); // Chart grid setting
 	s_p_v = lv_chart_add_series(c_p_v, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
 
-	// PFC current chart
-	lv_obj_t * c_p_i = objects.pfc_current_chart;
-	lv_chart_set_point_count(c_p_i, 120); // last 120 samples on screen
-	lv_chart_set_type(c_p_i, LV_CHART_TYPE_LINE);
-	lv_chart_set_update_mode(c_p_i, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
-	lv_chart_set_axis_range(c_p_i, LV_CHART_AXIS_PRIMARY_Y, 0, 10*1000); // amps (scaled by 1000 for 3 d.p.)
-	lv_obj_set_style_size(c_p_i, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
-	lv_chart_set_div_line_count(c_p_i, 4+2, 3+2); // Chart grid setting
-	s_p_i = lv_chart_add_series(c_p_i, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
-
 	// Temperature 1 chart
 	lv_obj_t * c_t_1 = objects.temperature_chart_1;
 	lv_chart_set_point_count(c_t_1, 120); // last 120 samples on screen
@@ -849,7 +987,6 @@ static void charts_feed_cb(lv_timer_t * t)
     float o_p = OutputPower;
     float b_v = BatteryVoltage;
     float p_v = PFCVoltage;
-    float p_i = pfc_i;
     float temperature[3];
     temperature[0] = temp[0];
     temperature[1] = temp[1];
@@ -872,9 +1009,6 @@ static void charts_feed_cb(lv_timer_t * t)
 	if(p_v < 0) p_v = 0;
 	if(p_v > 600) p_v = 600;
 
-    if(p_i < 0) p_i = 0;
-    if(p_i > 10) p_i = 10;
-
     for(int k = 0; k < 3; k++) {
         if(temperature[k] < 0) temperature[k] = 0;
         if(temperature[k] > 100) temperature[k] = 100;
@@ -887,7 +1021,6 @@ static void charts_feed_cb(lv_timer_t * t)
 
 	lv_chart_set_next_value(objects.battery_voltage_chart, s_b_v, (int32_t)(b_v * 10.0f + 0.5f));
 	lv_chart_set_next_value(objects.pfc_voltage_chart,     s_p_v, (int32_t)(p_v * 10.0f + 0.5f));
-	lv_chart_set_next_value(objects.pfc_current_chart,     s_p_i, (int32_t)(p_i * 1000.0f + 0.5f));
 
 	lv_chart_set_next_value(objects.temperature_chart_1, s_t_1, (int32_t)(temperature[0] * 10.0f + 0.5f));
 	lv_chart_set_next_value(objects.temperature_chart_2, s_t_2, (int32_t)(temperature[1] * 10.0f + 0.5f));
@@ -900,7 +1033,6 @@ static void charts_feed_cb(lv_timer_t * t)
 
 	lv_label_set_text(objects.battery_voltage_label, get_var_voltage_text(b_v));
 	lv_label_set_text(objects.pfc_voltage_label,     get_var_voltage_text(p_v));
-	lv_label_set_text(objects.pfc_current_label,     get_var_current_text(p_i));
 
 	lv_label_set_text(objects.temperature_label_1, get_var_temperature_text(temperature[0]));
 	lv_label_set_text(objects.temperature_label_2, get_var_temperature_text(temperature[1]));
@@ -919,7 +1051,6 @@ void start_charts(void)
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-	button_callback_called += 1;
     if (GPIO_Pin == GPIO_PIN_3)
     {
         uint32_t now = HAL_GetTick();
@@ -931,6 +1062,21 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         }
     }
 
+}
+
+// === Status/ fault update to HV ===
+
+static void LV_status_share(lv_timer_t * t)
+{
+    (void)t;
+
+    if (BMS_error_code == 0xFFFF) 
+    {
+        printfDma("\\F 1\n");
+    } else if (BMS_error_code == 0x00FF || BMS_error_code == 0x0000) 
+    {
+        printfDma("\\F 0\n");
+    }
 }
 
 
