@@ -72,14 +72,14 @@ Receives:
 
 * Constant voltage setpoint
 * Constant current setpoint
+  * CC/CV settings can also be configured using the GUI.
 * BMS fault status
-* * CC/CV settings can also be configured using the GUI.
 
 The charger HMI automatically updates:
 
 * Constant Voltage (CV) target
 * Constant Current (CC) target
-* Fault indications
+* Fault indication
 
 ### UART Communication
 
