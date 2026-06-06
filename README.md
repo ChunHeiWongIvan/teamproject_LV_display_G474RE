@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project is a touchscreen Human-Machine Interface (HMI) for a high-voltage battery charger.
+This project is a touchscreen Human-Machine Interface (HMI) for a wide voltage range Li-ion battery charger designed for Formula Student.
 
 The system runs on an STM32G474RE and provides:
 
