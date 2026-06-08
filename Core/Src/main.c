@@ -987,7 +987,7 @@ static void charts_init(void) // LVGL charts can only plot integers. Scaling use
 	lv_chart_set_point_count(c_o_p, 120); // last 120 samples on screen
 	lv_chart_set_type(c_o_p, LV_CHART_TYPE_LINE);
 	lv_chart_set_update_mode(c_o_p, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
-	lv_chart_set_axis_range(c_o_p, LV_CHART_AXIS_PRIMARY_Y, 0, 10*1000); // kilowatts (scaled by 1000 for 3 d.p.)
+	lv_chart_set_axis_range(c_o_p, LV_CHART_AXIS_PRIMARY_Y, 0, 4*1000); // kilowatts (scaled by 1000 for 3 d.p.)
 	lv_obj_set_style_size(c_o_p, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
 	lv_chart_set_div_line_count(c_o_p, 3+2, 3+2); // Chart grid setting
 	s_o_p = lv_chart_add_series(c_o_p, lv_palette_main(LV_PALETTE_GREEN), LV_CHART_AXIS_PRIMARY_Y);
