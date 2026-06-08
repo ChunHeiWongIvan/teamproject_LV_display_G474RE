@@ -91,12 +91,11 @@ typedef struct {
 // CAN TX IDs
 #define CAN_ID_TELEM_1   0x01000000
 #define CAN_ID_TELEM_2   0x02000000
-#define CAN_ID_TELEM_3   0x03000000
-#define CAN_ID_TELEM_4   0x04000000
 #define CAN_ID_STATUS    0x01100000
 
 // CAN RX ID
-#define CAN_ID_RX 0x0FFFFFFF
+#define CAN_ID_RX           0x00FFFFFF
+#define CAN_ID_DISCHARGE_RX 0x00000001
 
 // Debug screen text update
 #define OK_TEXT    "#00FF00 OK#"
@@ -197,7 +196,7 @@ extern float current_to_bar(float i, float MIN, float MAX);
 extern float get_current_max_for_voltage(float voltage);
 
 // === CAN TX for debugging ===
-static void can_pack_float(uint8_t *data, uint8_t byte_index, float value);
+static void can_pack_floattoint16(uint8_t *data, uint8_t byte_index, float value, float scale);
 static HAL_StatusTypeDef can_tx_ext(uint32_t id, uint8_t data[8]);
 static void can_tx_charger_telemetry(void);
 
@@ -768,6 +767,10 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
             	log_can_data(RxData);
             	can_setpoint_update_pending = 1;
             }
+            if (RxHeader.Identifier == CAN_ID_DISCHARGE_RX)
+            {
+                printfDma("\\D\n");
+            }
         }
     }
 }
@@ -855,9 +858,15 @@ void update_setpoints_from_can(float voltage, float current) {
 
 // === CAN tx for debugging ===
 
-static void can_pack_float(uint8_t *data, uint8_t byte_index, float value)
+//static void can_pack_float(uint8_t *data, uint8_t byte_index, float value)
+//{
+//    memcpy(&data[byte_index], &value, sizeof(float));
+//}
+
+static void can_pack_floattoint16(uint8_t *data, uint8_t byte_index, float value, float scale)
 {
-    memcpy(&data[byte_index], &value, sizeof(float));
+    int16_t scaledval = value * scale;
+    memcpy(&data[byte_index], &scaledval, 2);
 }
 
 static HAL_StatusTypeDef can_tx_ext(uint32_t id, uint8_t data[8])
@@ -882,24 +891,18 @@ static void can_tx_charger_telemetry(void)
     uint8_t data[8];
 
     memset(data, 0, sizeof(data));
-    can_pack_float(data, 0, PFCVoltage);
-    can_pack_float(data, 4, OutputVoltage);
+    can_pack_floattoint16(data, 0, PFCVoltage, 10);
+    can_pack_floattoint16(data, 2, OutputVoltage, 10);
+    can_pack_floattoint16(data, 4, OutputCurrent, 10);
+    can_pack_floattoint16(data, 6, BatteryVoltage, 10);
     can_tx_ext(CAN_ID_TELEM_1, data);
 
     memset(data, 0, sizeof(data));
-    can_pack_float(data, 0, OutputCurrent);
-    can_pack_float(data, 4, BatteryVoltage);
+    can_pack_floattoint16(data, 0, OutputPower, 1);
+    can_pack_floattoint16(data, 2, temp[0], 10);
+    can_pack_floattoint16(data, 4, temp[1], 10);
+    can_pack_floattoint16(data, 6, temp[2], 10);
     can_tx_ext(CAN_ID_TELEM_2, data);
-
-    memset(data, 0, sizeof(data));
-    can_pack_float(data, 0, OutputPower);
-    can_pack_float(data, 4, temp[0]);
-    can_tx_ext(CAN_ID_TELEM_3, data);
-
-    memset(data, 0, sizeof(data));
-    can_pack_float(data, 0, temp[1]);
-    can_pack_float(data, 4, temp[2]);
-    can_tx_ext(CAN_ID_TELEM_4, data);
 
     memset(data, 0, sizeof(data));
     data[0] = (uint8_t)charger_state;
