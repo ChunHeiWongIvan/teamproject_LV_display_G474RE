@@ -58,7 +58,7 @@ BO_ 2181038080 Charger_Telemetry_2: 8 Vector__XXX
 
 BO_ 2165309440 Charger_Status: 8 Vector__XXX
 	SG_ STATE : 0|8@1+ (1,0) [0|0] "" Vector__XXX
-	SG_ ERR_CODE : 8|8@1+ (1,0) [0|0] "" Vector__XXX
+	SG_ ERR_CODE : 8|16@1+ (1,0) [0|0] "" Vector__XXX
 
 BO_ 2147483649 Charger_Discharge: 8 Vector__XXX
 	SG_ RESERVED : 0|8@1+ (0,0) [0|0] "" Vector__XXX

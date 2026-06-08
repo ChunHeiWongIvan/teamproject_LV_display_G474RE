@@ -82,6 +82,7 @@ typedef struct {
 #define BUTTON_DEBOUNCE_PERIOD 750 // 2.5 second debounce for start/stop button
 
 // Error code definitions for bitmask
+// Error code definitions for bitmask
 #define ERR_VIN_LOW     0x01
 #define ERR_OVERCURRENT 0x02
 #define ERR_OVERVOLTAGE 0x04
@@ -118,7 +119,7 @@ typedef struct {
 /* USER CODE BEGIN PV */
 
 static volatile charger_state_t charger_state = CHARGER_IDLE; // Initialize charger state at IDLE and not connected to battery
-static volatile uint8_t charger_errorCode = 0x00; // Initialise charger with no debug errors
+static volatile uint16_t charger_errorCode = 0x0000; // Initialise charger with no debug errors
 static volatile uint8_t uart_counter = 0; // Updates every 100 ms, if nothing then UART fail
 static volatile uint8_t can_counter = 0; // Updates every 100 ms, if nothing then CAN fail
 
@@ -182,7 +183,7 @@ const char * get_var_power_text(float p);
 const char * get_var_temperature_text(float t);
 static void increment_uart_timer(lv_timer_t * t);
 static void increment_can_timer(lv_timer_t * t);
-static void update_error_labels(uint8_t errorCode);
+static void update_error_labels(uint16_t errorCode);
 extern const char * get_var_constant_voltage_setpoint_text(void);
 extern const char * get_var_constant_current_setpoint_text(void);
 
@@ -722,7 +723,7 @@ static void increment_uart_timer(lv_timer_t * t)
         uart_counter++;
 }
 
-static void update_error_labels(uint8_t errorCode) // Helper for updating debug menu
+static void update_error_labels(uint16_t errorCode) // Helper for updating debug menu
 {
     char hv_text[64];
     char overall_text[32];
@@ -922,8 +923,9 @@ static void can_tx_charger_telemetry(void)
 
     memset(data, 0, sizeof(data));
     data[0] = (uint8_t)charger_state;
-    data[1] = (uint8_t)charger_errorCode;
-    data[2] = 0x00;
+    data[1] = (uint8_t)(charger_errorCode & 0xFF);
+    data[2] = (uint8_t)(charger_errorCode >> 8);
+    data[3] = 0x00;
     can_tx_ext(CAN_ID_STATUS, data);
 }
 
@@ -939,7 +941,7 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len)
     unsigned int err_tmp;
 
     if (sscanf((char *)buffer,
-               "VI:%7f, VO:%7f, IO:%7f, VB:%7f, PO:%9f, T1:%7f, T2:%7f, T3:%7f, ST:%1d, ER:%02x\n",
+               "VI:%7f, VO:%7f, IO:%7f, VB:%7f, PO:%9f, T1:%7f, T2:%7f, T3:%7f, ST:%1d, ER:%04x\n",
                &PFCVoltage,
                &OutputVoltage,
                &OutputCurrent,
@@ -952,7 +954,7 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len)
                &err_tmp) == 10)
     {
         charger_state = (charger_state_t)state_tmp;
-        charger_errorCode = (uint8_t)err_tmp;
+        charger_errorCode = (uint16_t)err_tmp;
 
         can_tx_telemetry_pending = 1; // queue CAN TX after message received
     }
