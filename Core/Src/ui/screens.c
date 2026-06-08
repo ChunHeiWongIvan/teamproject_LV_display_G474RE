@@ -2299,7 +2299,7 @@ void create_screen_view_debug() {
             lv_obj_set_style_width(obj, 80, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_text_font(obj, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_text_line_space(obj, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_label_set_text(obj, "UART\nCAN");
+            lv_label_set_text(obj, "UART_RX\nCAN_RX");
         }
         {
             lv_obj_t *obj = lv_label_create(parent_obj);

@@ -13,14 +13,14 @@ static int32_t clamp_i32(int32_t x, int32_t lo, int32_t hi) // Helper clamp func
     return x;
 }
 
-float clamp_float(float x, float lo, float hi) // Helper clamp function, float
+static float clamp_float(float x, float lo, float hi) // Helper clamp function, float
 {
     if(x < lo) return lo;
     if(x > hi) return hi;
     return x;
 }
 
-int32_t voltage_to_bar(int32_t v, int32_t MIN, int32_t MAX) // Helper to convert voltage into bar percentage
+static int32_t voltage_to_bar(int32_t v, int32_t MIN, int32_t MAX) // Helper to convert voltage into bar percentage
 {
     v = clamp_i32(v, MIN, MAX);
 
@@ -28,7 +28,7 @@ int32_t voltage_to_bar(int32_t v, int32_t MIN, int32_t MAX) // Helper to convert
     return (int32_t)((v - MIN) * 100 / (MAX - MIN));
 }
 
-float current_to_bar(float i, float MIN, float MAX) // Helper to convert current into bar percentage
+static float current_to_bar(float i, float MIN, float MAX) // Helper to convert current into bar percentage
 {
     i = clamp_float(i, MIN, MAX);
 
@@ -36,7 +36,7 @@ float current_to_bar(float i, float MIN, float MAX) // Helper to convert current
     return (float)((i - MIN) * 100 / (MAX - MIN));
 }
 
-float get_current_max_for_voltage(float voltage) // Helper for calculating max current depending on voltage
+static float get_current_max_for_voltage(float voltage) // Helper for calculating max current depending on voltage
 {
     if(voltage <= 400.0f)
     {

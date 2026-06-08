@@ -55,12 +55,12 @@ extern void LCD_IO_Init(void);
 
 typedef enum
 {
-	CHARGER_IDLE_NC_BAT,
-	CHARGER_IDLE_C_BAT,
+	CHARGER_IDLE,
+	CHARGER_IDLE_BATT,
     CHARGER_PRECHARGE,
-    CHARGER_CHARGING,
-	CHARGER_SHUTDOWN,
-    CHARGER_FAULT,
+    CHARGER_ACTIVE,
+	CHARGER_DISCHARGE,
+    CHARGER_ERROR,
 	CHARGER_STATE_TOTAL
 } charger_state_t; // Charger states: Idle (battery not connected), Idle (battery connected), Pre-Charge, Charging, Fault
 
@@ -88,6 +88,16 @@ typedef struct {
 #define ERR_OVERPOWER   0x08
 #define ERR_OVERTEMP    0x10
 
+// CAN TX IDs
+#define CAN_ID_TELEM_1   0x01000000
+#define CAN_ID_TELEM_2   0x02000000
+#define CAN_ID_TELEM_3   0x03000000
+#define CAN_ID_TELEM_4   0x04000000
+#define CAN_ID_STATUS    0x01100000
+
+// CAN RX ID
+#define CAN_ID_RX 0x0FFFFFFF
+
 // Debug screen text update
 #define OK_TEXT    "#00FF00 OK#"
 #define FAIL_TEXT "#FF0000 FAIL#"
@@ -108,7 +118,7 @@ typedef struct {
 
 /* USER CODE BEGIN PV */
 
-static volatile charger_state_t charger_state = CHARGER_IDLE_NC_BAT; // Initialize charger state at IDLE and not connected to battery
+static volatile charger_state_t charger_state = CHARGER_IDLE; // Initialize charger state at IDLE and not connected to battery
 static volatile uint8_t charger_errorCode = 0x00; // Initialise charger with no debug errors
 static volatile uint8_t uart_counter = 0; // Updates every 100 ms, if nothing then UART fail
 static volatile uint8_t can_counter = 0; // Updates every 100 ms, if nothing then CAN fail
@@ -122,6 +132,9 @@ static volatile float target_v = 0.0f;
 static volatile float target_i = 0.0f;
 static volatile uint16_t BMS_error_code = 0x0000;
 volatile uint8_t can_setpoint_update_pending = 0; // In order to not update labels inside CAN RX ISR
+
+// For queueing CAN tx
+static volatile uint8_t can_tx_telemetry_pending = 0;
 
 // Charts and variables for storing voltage/ current measurements received via UART
 static lv_chart_series_t * s_o_v = NULL; // output voltage chart
@@ -182,6 +195,11 @@ extern float clamp_float(float x, float lo, float hi);
 extern int32_t voltage_to_bar(int32_t v, int32_t MIN, int32_t MAX);
 extern float current_to_bar(float i, float MIN, float MAX);
 extern float get_current_max_for_voltage(float voltage);
+
+// === CAN TX for debugging ===
+static void can_pack_float(uint8_t *data, uint8_t byte_index, float value);
+static HAL_StatusTypeDef can_tx_ext(uint32_t id, uint8_t data[8]);
+static void can_tx_charger_telemetry(void);
 
 // === UART data plotting ===
 static void charts_init(void);
@@ -346,9 +364,15 @@ int main(void)
           update_setpoints_from_can(target_v, target_i);
       }
 
+      if (can_tx_telemetry_pending)
+      {
+          can_tx_telemetry_pending = 0;
+          can_tx_charger_telemetry();
+      }
+
 	  switch(charger_state) // Charger state machine
 	  {
-	      case CHARGER_IDLE_NC_BAT:
+	      case CHARGER_IDLE:
 
 	    	  // Status widget
 	          lv_label_set_text(objects.status_label,
@@ -376,7 +400,7 @@ int main(void)
 
 	          break;
 
-	      case CHARGER_IDLE_C_BAT:
+	      case CHARGER_IDLE_BATT:
 
 	    	  // Status widget
 	      	  lv_label_set_text(objects.status_label,
@@ -440,7 +464,7 @@ int main(void)
 
 	          break;
 
-	      case CHARGER_CHARGING:
+	      case CHARGER_ACTIVE:
 
 	    	  // Status widget
 	          lv_label_set_text(objects.status_label,
@@ -474,12 +498,19 @@ int main(void)
 
 	          break;
 
-	      case CHARGER_SHUTDOWN:
-	    	  charger_state = CHARGER_IDLE_C_BAT;
+	      case CHARGER_DISCHARGE:
+	    	  // Status widget
+	          lv_label_set_text(objects.status_label,
+	                            "DISCHARGING");
+	          lv_label_set_text(objects.detailed_status_label,
+								"");
+	          lv_obj_set_style_bg_color(objects.status_container,
+	                                    lv_color_hex(0x464646),
+	                                    0);
 
 	    	  break;
 
-	      case CHARGER_FAULT:
+	      case CHARGER_ERROR:
 
 	    	  // Status widget
 	          lv_label_set_text(objects.status_label,
@@ -731,7 +762,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
         // Check if message uses extended ID
         if (RxHeader.IdType == FDCAN_EXTENDED_ID)
         {
-            if (RxHeader.Identifier == 0x000000FF)
+            if (RxHeader.Identifier == CAN_ID_RX)
             {
                 can_counter = 0;
             	log_can_data(RxData);
@@ -743,60 +774,31 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
 
 static void log_can_data(uint8_t *data)
 {
-    uint32_t voltage_bcd = 0;
-    uint32_t current_bcd = 0;
+    uint32_t voltage_raw = 0;
+    uint32_t current_raw = 0;
 
-    voltage_bcd =
-        ((uint32_t)data[0] << 16) |
-        ((uint32_t)data[1] << 8 ) |
-        ((uint32_t)data[2]);
+    // Bytes 0-2: CV setpoint, unsigned 24-bit integer
+    voltage_raw =
+        ((uint32_t)data[0])       |
+        ((uint32_t)data[1] << 8)  |
+        ((uint32_t)data[2] << 16);
 
-    current_bcd =
-        ((uint32_t)data[3] << 16) |
-        ((uint32_t)data[4] << 8 ) |
-        ((uint32_t)data[5]);
+    // Bytes 3-5: CC setpoint, unsigned 24-bit integer
+    current_raw =
+        ((uint32_t)data[3])       |
+        ((uint32_t)data[4] << 8)  |
+        ((uint32_t)data[5] << 16);
 
+    // Bytes 6-7: BMS status / error code
     BMS_error_code =
-        ((uint16_t)data[6] << 8) |
-        ((uint16_t)data[7]);
+        ((uint16_t)data[6]) |
+        ((uint16_t)data[7] << 8);
 
-    uint8_t v_digits[6];
-    uint8_t i_digits[6];
-
-    for (int i = 0; i < 6; i++)
-    {
-        v_digits[i] = (voltage_bcd >> ((5 - i) * 4)) & 0x0F;
-        i_digits[i] = (current_bcd >> ((5 - i) * 4)) & 0x0F;
-
-        if (v_digits[i] > 9 || i_digits[i] > 9)
-            return;
-    }
-
-    // Voltage format: xxx.xxx
-    target_v =
-        (float)(
-            v_digits[0] * 100 +
-            v_digits[1] * 10  +
-            v_digits[2]
-        )
-        +
-        (float)(
-            v_digits[3] * 100 +
-            v_digits[4] * 10  +
-            v_digits[5]
-        ) / 1000.0f;
-
-    // Current format: x.xxxxx
-    target_i =
-        (float)i_digits[0]
-        +
-        (float)(
-            i_digits[1] * 10000 +
-            i_digits[2] * 1000  +
-            i_digits[3] * 100   +
-            i_digits[4] * 10    +
-            i_digits[5]
-        ) / 100000.0f;
+    // DBC scaling:
+    // CV factor = 0.0001 V/bit
+    // CC factor = 0.00001 A/bit
+    target_v = (float)voltage_raw * 0.0001f;
+    target_i = (float)current_raw * 0.00001f;
 }
 
 void update_setpoints_from_can(float voltage, float current) {
@@ -851,7 +853,60 @@ void update_setpoints_from_can(float voltage, float current) {
                      LV_ANIM_ON);
 }
 
+// === CAN tx for debugging ===
 
+static void can_pack_float(uint8_t *data, uint8_t byte_index, float value)
+{
+    memcpy(&data[byte_index], &value, sizeof(float));
+}
+
+static HAL_StatusTypeDef can_tx_ext(uint32_t id, uint8_t data[8])
+{
+    FDCAN_TxHeaderTypeDef txHeader = {0};
+
+    txHeader.Identifier = id;
+    txHeader.IdType = FDCAN_EXTENDED_ID;
+    txHeader.TxFrameType = FDCAN_DATA_FRAME;
+    txHeader.DataLength = FDCAN_DLC_BYTES_8;
+    txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    txHeader.BitRateSwitch = FDCAN_BRS_OFF;
+    txHeader.FDFormat = FDCAN_CLASSIC_CAN;
+    txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    txHeader.MessageMarker = 0;
+
+    return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &txHeader, data);
+}
+
+static void can_tx_charger_telemetry(void)
+{
+    uint8_t data[8];
+
+    memset(data, 0, sizeof(data));
+    can_pack_float(data, 0, PFCVoltage);
+    can_pack_float(data, 4, OutputVoltage);
+    can_tx_ext(CAN_ID_TELEM_1, data);
+
+    memset(data, 0, sizeof(data));
+    can_pack_float(data, 0, OutputCurrent);
+    can_pack_float(data, 4, BatteryVoltage);
+    can_tx_ext(CAN_ID_TELEM_2, data);
+
+    memset(data, 0, sizeof(data));
+    can_pack_float(data, 0, OutputPower);
+    can_pack_float(data, 4, temp[0]);
+    can_tx_ext(CAN_ID_TELEM_3, data);
+
+    memset(data, 0, sizeof(data));
+    can_pack_float(data, 0, temp[1]);
+    can_pack_float(data, 4, temp[2]);
+    can_tx_ext(CAN_ID_TELEM_4, data);
+
+    memset(data, 0, sizeof(data));
+    data[0] = (uint8_t)charger_state;
+    data[1] = (uint8_t)charger_errorCode;
+    data[2] = 0x00;
+    can_tx_ext(CAN_ID_STATUS, data);
+}
 
 // === UART Initialization ===
 
@@ -879,6 +934,8 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len)
     {
         charger_state = (charger_state_t)state_tmp;
         charger_errorCode = (uint8_t)err_tmp;
+
+        can_tx_telemetry_pending = 1; // queue CAN TX after message received
     }
 }
 
@@ -1059,12 +1116,13 @@ static void LV_status_share(lv_timer_t * t)
 {
     (void)t;
 
-    if (BMS_error_code == 0xFFFF) 
-    {
-        printfDma("\\F 1\n");
-    } else if (BMS_error_code == 0x00FF || BMS_error_code == 0x0000) 
+    if (BMS_error_code == 0x0000)
     {
         printfDma("\\F 0\n");
+    }
+    else
+    {
+        printfDma("\\F 1\n");
     }
 }
 
