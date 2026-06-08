@@ -102,7 +102,7 @@ typedef struct {
 #define FAIL_TEXT "#FF0000 FAIL#"
 
 // For updating CV/CC labels from CAN
-#define V_MIN 0.0f
+#define V_MIN 200.0f
 #define V_MAX 600.0f
 #define I_MIN 0.0f
 
@@ -369,6 +369,11 @@ int main(void)
           can_tx_charger_telemetry();
       }
 
+      if (uart_counter > 10)
+      {
+          charger_state = CHARGER_ERROR;
+      }
+
 	  switch(charger_state) // Charger state machine
 	  {
 	      case CHARGER_IDLE:
@@ -396,6 +401,8 @@ int main(void)
 
 	          // Set parameters button (unlocked)
 	          lv_obj_remove_state(objects.set_parameters_button, LV_STATE_DISABLED);
+	          lv_label_set_text(objects.set_parameters_label,
+	                            "Set\nParameters");
 
 	          break;
 
@@ -514,8 +521,17 @@ int main(void)
 	    	  // Status widget
 	          lv_label_set_text(objects.status_label,
 	                            "FAULT");
-	          lv_label_set_text(objects.detailed_status_label,
-								"Shutdown circuit opened");
+	          if (uart_counter > 10){
+	              lv_label_set_text(objects.detailed_status_label,
+	                                "UART RX timeout");
+	          } else if (BMS_error_code != 0x0000){
+	              lv_label_set_text(objects.detailed_status_label,
+	                                "Shutdown circuit opened");
+	          } else {
+	              lv_label_set_text(objects.detailed_status_label,
+                                    "Charger fault");
+	          }
+
 	          lv_obj_set_style_bg_color(objects.status_container,
 	                                    lv_color_hex(0xB40000),
 	                                    0);
@@ -801,7 +817,7 @@ static void log_can_data(uint8_t *data)
     // CV factor = 0.0001 V/bit
     // CC factor = 0.00001 A/bit
     target_v = (float)voltage_raw * 0.0001f;
-    target_i = (float)current_raw * 0.00001f;
+    target_i = (float)current_raw * 0.000001f;
 }
 
 void update_setpoints_from_can(float voltage, float current) {
