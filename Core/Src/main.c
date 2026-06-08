@@ -199,7 +199,7 @@ extern float get_current_max_for_voltage(float voltage);
 // === CAN TX for debugging ===
 static void can_pack_float(uint8_t *data, uint8_t byte_index, float value);
 static HAL_StatusTypeDef can_tx_ext(uint32_t id, uint8_t data[8]);
-static void can_tx_charger_telemetry(void);
+static void can_tx_service(void);
 
 // === UART data plotting ===
 static void charts_init(void);
@@ -367,7 +367,7 @@ int main(void)
       if (can_tx_telemetry_pending)
       {
           can_tx_telemetry_pending = 0;
-          can_tx_charger_telemetry();
+          can_tx_service();
       }
 
 	  switch(charger_state) // Charger state machine
@@ -877,35 +877,54 @@ static HAL_StatusTypeDef can_tx_ext(uint32_t id, uint8_t data[8])
     return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &txHeader, data);
 }
 
-static void can_tx_charger_telemetry(void)
+static void can_tx_service(void)
 {
-    uint8_t data[8];
+    static uint8_t step = 0;
+    uint8_t data[8] = {0};
 
-    memset(data, 0, sizeof(data));
-    can_pack_float(data, 0, PFCVoltage);
-    can_pack_float(data, 4, OutputVoltage);
-    can_tx_ext(CAN_ID_TELEM_1, data);
+    if (!can_tx_telemetry_pending)
+        return;
 
-    memset(data, 0, sizeof(data));
-    can_pack_float(data, 0, OutputCurrent);
-    can_pack_float(data, 4, BatteryVoltage);
-    can_tx_ext(CAN_ID_TELEM_2, data);
+    if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan2) == 0)
+        return;
 
-    memset(data, 0, sizeof(data));
-    can_pack_float(data, 0, OutputPower);
-    can_pack_float(data, 4, temp[0]);
-    can_tx_ext(CAN_ID_TELEM_3, data);
+    switch (step)
+    {
+        case 0:
+            can_pack_float(data, 0, PFCVoltage);
+            can_pack_float(data, 4, OutputVoltage);
+            if (can_tx_ext(CAN_ID_TELEM_1, data) == HAL_OK) step++;
+            break;
 
-    memset(data, 0, sizeof(data));
-    can_pack_float(data, 0, temp[1]);
-    can_pack_float(data, 4, temp[2]);
-    can_tx_ext(CAN_ID_TELEM_4, data);
+        case 1:
+            can_pack_float(data, 0, OutputCurrent);
+            can_pack_float(data, 4, BatteryVoltage);
+            if (can_tx_ext(CAN_ID_TELEM_2, data) == HAL_OK) step++;
+            break;
 
-    memset(data, 0, sizeof(data));
-    data[0] = (uint8_t)charger_state;
-    data[1] = (uint8_t)charger_errorCode;
-    data[2] = 0x00;
-    can_tx_ext(CAN_ID_STATUS, data);
+        case 2:
+            can_pack_float(data, 0, OutputPower);
+            can_pack_float(data, 4, temp[0]);
+            if (can_tx_ext(CAN_ID_TELEM_3, data) == HAL_OK) step++;
+            break;
+
+        case 3:
+            can_pack_float(data, 0, temp[1]);
+            can_pack_float(data, 4, temp[2]);
+            if (can_tx_ext(CAN_ID_TELEM_4, data) == HAL_OK) step++;
+            break;
+
+        case 4:
+            data[0] = (uint8_t)charger_state;
+            data[1] = charger_errorCode;
+            data[2] = 0;
+            if (can_tx_ext(CAN_ID_STATUS, data) == HAL_OK)
+            {
+                step = 0;
+                can_tx_telemetry_pending = 0;
+            }
+            break;
+    }
 }
 
 // === UART Initialization ===
