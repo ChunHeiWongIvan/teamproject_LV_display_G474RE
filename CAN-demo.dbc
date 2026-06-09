@@ -38,9 +38,10 @@ BU_:
 
 BO_ 2164260863 Charger_RX_BMS_TX: 8 Vector__XXX
 	SG_ CV_Setpoint : 0|24@1+ (0.0001,0) [200|600] "V" Vector__XXX
-	SG_ CC_Setpoint : 24|24@1+ (0.000001,0) [5|7.5] "A" Vector__XXX
-	SG_ BMS_Status : 48|16@1+ (1,0) [0|65535] "" Vector__XXX
+	SG_ CC_Setpoint : 24|24@1+ (0.000001,0) [0|7.5] "A" Vector__XXX
 
+BO_ 2149580799 CHARGER_RX_FAULT: 8 Vector__XXX
+	SG_ BMS_Status : 0|24@1+ (1,0) [0|16777215] "" Vector__XXX
 
 BO_ 2164260864 Charger_Telemetry_1: 8 Vector__XXX
 	SG_ PFCVoltage : 0|16@1+ (0.1,0) [0|0] "V" Vector__XXX
@@ -54,8 +55,6 @@ BO_ 2181038080 Charger_Telemetry_2: 8 Vector__XXX
 	SG_ Temperature_2 : 32|16@1+ (0.1,0) [0|0] "degC" Vector__XXX
 	SG_ Temperature_3 : 48|16@1+ (0.1,0) [0|0] "degC" Vector__XXX
 
-
-
 BO_ 2165309440 Charger_Status: 8 Vector__XXX
 	SG_ STATE : 0|8@1+ (1,0) [0|0] "" Vector__XXX
 	SG_ ERR_CODE : 8|16@1+ (1,0) [0|0] "" Vector__XXX
@@ -64,13 +63,17 @@ BO_ 2147483649 Charger_Discharge: 8 Vector__XXX
 	SG_ RESERVED : 0|8@1+ (0,0) [0|0] "" Vector__XXX
 
 
-CM_ BO_ 2164260863 "Charger RX for setpoints/ status from BMS";
+CM_ BO_ 2164260863 "Charger RX for CCCV setpoints from BMS";
 CM_ SG_ 2164260863 CV_Setpoint "Constant voltage setpoint";
 CM_ SG_ 2164260863 CC_Setpoint "Constant current setpoint";
-CM_ SG_ 2164260863 BMS_Status "BMS status (0 is normal)";
+
+CM_ BO_ 2149580799 "BMS/AMS/IMD/SDC fault status";
+CM_ SG_ 2149580799 BMS_Status "BMS fault status, 24-bit";
+
 CM_ BO_ 2164260864 "PFC_V, V_OUT, I_OUT, V_BATT";
 CM_ BO_ 2181038080 "P_OUT, TEMP_1, TEMP_2, TEMP_3";
 CM_ BO_ 2165309440 "STATE, ERR_CODE";
+
 BA_DEF_ SG_  "SPN" INT 0 524287;
 BA_DEF_ BO_  "VFrameFormat" ENUM  "StandardCAN","ExtendedCAN","reserved","J1939PG";
 BA_DEF_  "DatabaseVersion" STRING ;

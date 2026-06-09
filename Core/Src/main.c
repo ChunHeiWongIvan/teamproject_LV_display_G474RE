@@ -82,20 +82,27 @@ typedef struct {
 #define BUTTON_DEBOUNCE_PERIOD 750 // 2.5 second debounce for start/stop button
 
 // Error code definitions for bitmask
-// Error code definitions for bitmask
-#define ERR_VIN_LOW     0x01
-#define ERR_OVERCURRENT 0x02
-#define ERR_OVERVOLTAGE 0x04
-#define ERR_OVERPOWER   0x08
-#define ERR_OVERTEMP    0x10
+typedef enum {
+    ERR_UART_TIMEOUT    = 0x0001,
+    ERR_LV_FAULT        = 0x0002,
+    ERR_VIN_UV          = 0x0004,
+    ERR_VIN_OV          = 0x0008,
+    ERR_VOUT_OV         = 0x0010,
+    ERR_IOUT_OC         = 0x0020,
+    ERR_POUT_OP         = 0x0040,
+    ERR_TEMP_OT         = 0x0080,
+    ERR_VBAT_REVERSE    = 0x0100,
+    ERR_VBAT_OV         = 0x0200,
+} charger_err_codes;
 
 // CAN TX IDs
-#define CAN_ID_TELEM_1   0x01000000
-#define CAN_ID_TELEM_2   0x02000000
-#define CAN_ID_STATUS    0x01100000
+#define CAN_ID_TELEM_1      0x01000000
+#define CAN_ID_TELEM_2      0x02000000
+#define CAN_ID_STATUS       0x01100000
 
 // CAN RX ID
-#define CAN_ID_RX           0x00FFFFFF
+#define CAN_ID_RX_CCCV      0x00FFFFFF
+#define CAN_ID_RX_FAULT     0x001FFFFF
 #define CAN_ID_DISCHARGE_RX 0x00000001
 
 // Debug screen text update
@@ -119,6 +126,8 @@ typedef struct {
 /* USER CODE BEGIN PV */
 
 static volatile charger_state_t charger_state = CHARGER_IDLE; // Initialize charger state at IDLE and not connected to battery
+static volatile charger_state_t previous_charger_state = CHARGER_STATE_TOTAL; // Store previous state to track state transitions
+
 static volatile uint16_t charger_errorCode = 0x0000; // Initialise charger with no debug errors
 static volatile uint8_t uart_counter = 0; // Updates every 100 ms, if nothing then UART fail
 static volatile uint8_t can_counter = 0; // Updates every 100 ms, if nothing then CAN fail
@@ -190,6 +199,7 @@ extern const char * get_var_constant_current_setpoint_text(void);
 // === CAN message RX, parsing and processing ===
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs);
 static void log_can_data(uint8_t *data);
+static void log_can_fault(uint8_t *data);
 static void update_setpoints_from_can(float voltage, float current);
 extern float clamp_float(float x, float lo, float hi);
 extern int32_t voltage_to_bar(int32_t v, int32_t MIN, int32_t MAX);
@@ -375,6 +385,16 @@ int main(void)
           charger_state = CHARGER_ERROR;
       }
 
+      if (charger_state != previous_charger_state)
+      {
+          previous_charger_state = charger_state;
+
+          if (lv_screen_active() != objects.main_menu) // Return to main menu on state change to notify user
+          {
+              lv_screen_load(objects.main_menu);
+          }
+      }      
+
 	  switch(charger_state) // Charger state machine
 	  {
 	      case CHARGER_IDLE:
@@ -451,10 +471,6 @@ int main(void)
 	          // Parameters widget (locked)
 	          lv_label_set_text(objects.parameters_label,
 								"Parameters\n(locked)");
-	          if(lv_screen_active() == objects.set_parameters_1 || lv_screen_active() == objects.set_parameters_2)
-	          {
-	              lv_screen_load(objects.main_menu); // Kicks user out of settings if state changes while in settings
-	          }
 
 	          // Bottom left stats widget
 	          lv_label_set_text(objects.bottom_left_stat_desc,
@@ -485,10 +501,6 @@ int main(void)
 	          // Parameters widget (locked)
 	          lv_label_set_text(objects.parameters_label,
 								"Parameters\n(locked)");
-	          if(lv_screen_active() == objects.set_parameters_1 || lv_screen_active() == objects.set_parameters_2)
-	          {
-	              lv_screen_load(objects.main_menu); // Kicks user out of settings if state changes while in settings
-	          }
 
 	          // Bottom left stats widget
 	          lv_label_set_text(objects.bottom_left_stat_desc,
@@ -540,18 +552,14 @@ int main(void)
 	          // Parameters widget (locked)
 	          lv_label_set_text(objects.parameters_label,
 								"Parameters\n(locked)");
-	          if(lv_screen_active() == objects.set_parameters_1 || lv_screen_active() == objects.set_parameters_2)
-	          {
-	              lv_screen_load(objects.main_menu); // Kicks user out of settings if state changes while in settings
-	          }
 
 	          // Bottom left stats widget
 	          lv_label_set_text(objects.bottom_left_stat_desc,
 								"Output");
 	          lv_label_set_text(objects.main_menu_voltage_label,
-								get_var_voltage_text(OutputVoltage));
+								"N/A");
 			  lv_label_set_text(objects.main_menu_current_label,
-								get_var_current_text(OutputCurrent));
+								"");
 
 	          // Set parameters button (locked)
 			  lv_obj_add_state(objects.set_parameters_button, LV_STATE_DISABLED);
@@ -695,7 +703,7 @@ const char * get_var_current_text(float i) // Helper for displaying live current
     return buf;
 }
 
-const char * get_var_power_text(float p) // Helper for displaying live power values
+const char * get_var_power_text(float p) // Helper for displaying live power values in kW
 {
     static char buf[16];
     snprintf(buf,sizeof(buf),"%.3f kW", p);
@@ -725,24 +733,29 @@ static void increment_uart_timer(lv_timer_t * t)
 
 static void update_error_labels(uint16_t errorCode) // Helper for updating debug menu
 {
-    char hv_text[64];
+    char hv_text[96];
     char overall_text[32];
     char input_text[32];
-    char lv_text[64];
+    char lv_text[32];
 
     snprintf(hv_text, sizeof(hv_text),
-             "%s\n%s\n%s",
-             (errorCode & ERR_OVERVOLTAGE) ? FAIL_TEXT : OK_TEXT,
-             (errorCode & ERR_OVERCURRENT) ? FAIL_TEXT : OK_TEXT,
-             (errorCode & ERR_OVERPOWER)   ? FAIL_TEXT : OK_TEXT);
+             "%s\n%s\n%s\n%s\n%s\n%s",
+             (errorCode & ERR_UART_TIMEOUT) ? FAIL_TEXT : OK_TEXT,
+             (errorCode & ERR_VOUT_OV) ? FAIL_TEXT : OK_TEXT,
+             (errorCode & ERR_IOUT_OC)   ? FAIL_TEXT : OK_TEXT,
+             (errorCode & ERR_POUT_OP)   ? FAIL_TEXT : OK_TEXT,
+             (errorCode & ERR_VBAT_REVERSE)   ? FAIL_TEXT : OK_TEXT,
+             (errorCode & ERR_VBAT_OV)   ? FAIL_TEXT : OK_TEXT);
 
     snprintf(overall_text, sizeof(overall_text),
-             "%s",
-             (errorCode & ERR_OVERTEMP) ? FAIL_TEXT : OK_TEXT);
+             "%s\n%s",
+             (errorCode & ERR_TEMP_OT) ? FAIL_TEXT : OK_TEXT,
+             (errorCode & ERR_LV_FAULT) ? FAIL_TEXT : OK_TEXT);
 
     snprintf(input_text, sizeof(input_text),
-             "%s",
-             (errorCode & ERR_VIN_LOW) ? FAIL_TEXT : OK_TEXT);
+             "%s\n%s",
+             (errorCode & ERR_VIN_UV) ? FAIL_TEXT : OK_TEXT,
+             (errorCode & ERR_VIN_OV) ? FAIL_TEXT : OK_TEXT);
 
     snprintf(lv_text, sizeof(lv_text),
             "%s\n%s",
@@ -778,11 +791,15 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
         // Check if message uses extended ID
         if (RxHeader.IdType == FDCAN_EXTENDED_ID)
         {
-            if (RxHeader.Identifier == CAN_ID_RX)
+            if (RxHeader.Identifier == CAN_ID_RX_CCCV)
             {
-                can_counter = 0;
             	log_can_data(RxData);
-            	can_setpoint_update_pending = 1;
+            	can_setpoint_update_pending = 1; // set flag for changing setpoint on next loop
+            }
+            if (RxHeader.Identifier == CAN_ID_RX_FAULT)
+            {
+            	log_can_fault(RxData);
+                can_counter = 0; // Only this periodic BMS status message is required for CAN OK
             }
             if (RxHeader.Identifier == CAN_ID_DISCHARGE_RX)
             {
@@ -809,16 +826,20 @@ static void log_can_data(uint8_t *data)
         ((uint32_t)data[4] << 8)  |
         ((uint32_t)data[5] << 16);
 
-    // Bytes 6-7: BMS status / error code
-    BMS_error_code =
-        ((uint16_t)data[6]) |
-        ((uint16_t)data[7] << 8);
-
     // DBC scaling:
     // CV factor = 0.0001 V/bit
     // CC factor = 0.00001 A/bit
     target_v = (float)voltage_raw * 0.0001f;
     target_i = (float)current_raw * 0.000001f;
+}
+
+static void log_can_fault(uint8_t *data)
+{
+    // Bytes 0-2: BMS status / error code
+    BMS_error_code =
+        ((uint32_t)data[0])       |
+        ((uint32_t)data[1] << 8)  |
+        ((uint32_t)data[2] << 16);
 }
 
 void update_setpoints_from_can(float voltage, float current) {
@@ -969,9 +990,9 @@ static void charts_init(void) // LVGL charts can only plot integers. Scaling use
     lv_chart_set_point_count(c_o_v, 120); // last 120 samples on screen
     lv_chart_set_type(c_o_v, LV_CHART_TYPE_LINE);
     lv_chart_set_update_mode(c_o_v, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
-    lv_chart_set_axis_range(c_o_v, LV_CHART_AXIS_PRIMARY_Y, 0, 600*10); // volts (scaled by 10 for 1 d.p.)
+    lv_chart_set_axis_range(c_o_v, LV_CHART_AXIS_PRIMARY_Y, 0, 700*10); // volts (scaled by 10 for 1 d.p.)
     lv_obj_set_style_size(c_o_v, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
-    lv_chart_set_div_line_count(c_o_v, 5+2, 3+2); // Chart grid setting
+    lv_chart_set_div_line_count(c_o_v, 6+2, 3+2); // Chart grid setting
     s_o_v = lv_chart_add_series(c_o_v, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
 
     // Output current chart
@@ -999,9 +1020,9 @@ static void charts_init(void) // LVGL charts can only plot integers. Scaling use
 	lv_chart_set_point_count(c_b_v, 120); // last 120 samples on screen
 	lv_chart_set_type(c_b_v, LV_CHART_TYPE_LINE);
 	lv_chart_set_update_mode(c_b_v, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
-	lv_chart_set_axis_range(c_b_v, LV_CHART_AXIS_PRIMARY_Y, 0, 600*10); // volts (scaled by 10 for 1 d.p.)
+	lv_chart_set_axis_range(c_b_v, LV_CHART_AXIS_PRIMARY_Y, 0, 700*10); // volts (scaled by 10 for 1 d.p.)
 	lv_obj_set_style_size(c_b_v, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
-	lv_chart_set_div_line_count(c_b_v, 5+2, 3+2); // Chart grid setting
+	lv_chart_set_div_line_count(c_b_v, 6+2, 3+2); // Chart grid setting
 	s_b_v = lv_chart_add_series(c_b_v, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
 
 	// PFC voltage chart
@@ -1009,9 +1030,9 @@ static void charts_init(void) // LVGL charts can only plot integers. Scaling use
 	lv_chart_set_point_count(c_p_v, 120); // last 120 samples on screen
 	lv_chart_set_type(c_p_v, LV_CHART_TYPE_LINE);
 	lv_chart_set_update_mode(c_p_v, LV_CHART_UPDATE_MODE_SHIFT); // scrolling chart
-	lv_chart_set_axis_range(c_p_v, LV_CHART_AXIS_PRIMARY_Y, 0, 600*10); // volts (scaled by 10 for 1 d.p.)
+	lv_chart_set_axis_range(c_p_v, LV_CHART_AXIS_PRIMARY_Y, 0, 700*10); // volts (scaled by 10 for 1 d.p.)
 	lv_obj_set_style_size(c_p_v, 0, 0, LV_PART_INDICATOR); // remove chart dot for pure line chart
-	lv_chart_set_div_line_count(c_p_v, 5+2, 3+2); // Chart grid setting
+	lv_chart_set_div_line_count(c_p_v, 6+2, 3+2); // Chart grid setting
 	s_p_v = lv_chart_add_series(c_p_v, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
 
 	// Temperature 1 chart
@@ -1051,7 +1072,7 @@ static void charts_feed_cb(lv_timer_t * t)
 
     float o_v = OutputVoltage;
     float o_i = OutputCurrent;
-    float o_p = OutputPower;
+    float o_p = OutputPower / 1000.0f; // for displaying kW on chart. OutputPower is provided in W.
     float b_v = BatteryVoltage;
     float p_v = PFCVoltage;
     float temperature[3];
@@ -1143,7 +1164,7 @@ static void LV_status_share(lv_timer_t * t)
     }
     else
     {
-        printfDma("\\F 1\n");
+        printfDma("\\F %u\n", BMS_error_code);
     }
 }
 
