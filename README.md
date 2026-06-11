@@ -1,162 +1,311 @@
-# Custom UART Communication Protocol
+# EZEV Charger LV/ Human-Machine Interface (HMI)
 
-This project uses a custom UART packet format to send data between the HV MCU and the LV display MCU.
+## Overview
 
-The protocol is designed to be:
+This project is a touchscreen Human-Machine Interface (HMI) for a wide voltage range Li-ion battery charger designed for Formula Student.
 
-* simple to parse
-* compact
-* easy to extend with new message IDs
-* robust against partial UART reads by using a start byte and checksum
+The system runs on an STM32G474RE and provides:
 
----
+* Real-time charger monitoring
+* Touchscreen parameter configuration
+* Live telemetry plotting
+* Charger state visualization
+* CAN communication with a Battery Management System (BMS)
+* UART communication with the charger power stage (HV MCU) to fetch telemetry and send commands/setpoints
+* Fault monitoring and diagnostics
 
-## Packet Structure
-
-Each UART message has the following byte layout:
-
-| Field |    Size | Description                                     |
-| ----- | ------: | ----------------------------------------------- |
-| SOF   |  1 byte | Start of frame marker, always `0xA5`            |
-| ID    | 2 bytes | Message ID, little-endian                       |
-| DATA  | 2 bytes | Fixed 2-byte payload                            |
-| CRC   |  1 byte | XOR checksum of all previous bytes in the frame |
+The user interface is implemented using LVGL and designed in EEZ Studio.
 
 ---
 
-## Byte Layout
+## User Interface
 
+### Main Screen
+
+![Main Screen](screenshots/main_menu.png)
+
+Features:
+
+* Charger status
+* Live voltage/current display
+* CV and CC setpoints
+* Quick system overview
+
+---
+
+### Parameter Configuration
+
+![Parameter Configuration](screenshots/set_params.png)
+
+Features:
+
+* Constant Voltage adjustment
+* Constant Current adjustment
+* Safety limits
+
+---
+
+### Telemetry Charts
+
+![Telemetry Charts](screenshots/output_voltage.png)
+
+Features:
+
+* Live data plotting
+* Historical trend viewing
+* Multiple telemetry channels
+
+---
+
+### Debug Screen
+
+![Diagnostics](screenshots/debug_menu.png)
+
+Features:
+
+* Communication health monitoring
+* Fault reporting
+* Internal system status
+
+---
+
+## User Flow Block Diagram
+
+![Block Diagram](screenshots/block_diagram.png)
+
+---
+
+## Features
+
+### Touchscreen User Interface
+
+* 480 × 320 TFT LCD display
+* Capacitive touch input (GT911)
+* Multi-page graphical interface
+* Real-time status updates
+
+### Charger Monitoring
+
+Displays:
+
+* Output Voltage
+* Output Current
+* Output Power
+* Battery Voltage
+* PFC Voltage
+* Temperature Sensor 1
+* Temperature Sensor 2
+* Temperature Sensor 3
+
+### Live Telemetry Charts
+
+The system continuously plots:
+
+* Output voltage
+* Output current
+* Output power
+* Battery voltage
+* PFC voltage
+* Temperature sensors
+
+Historical telemetry is displayed using scrolling LVGL charts.
+
+### Charger State Machine
+
+Supported states:
+
+| State                       | Description                            |
+| --------------------------- | -------------------------------------- |
+| IDLE (Battery Disconnected) | Charger waiting for battery connection |
+| IDLE (Battery Connected)    | Battery detected, ready to start       |
+| PRE-CHARGE                  | Precharge sequence active              |
+| CHARGING                    | Active charging                        |
+| SHUTDOWN                    | Controlled shutdown                    |
+| FAULT                       | Charger fault state                    |
+
+### CAN Communication
+
+Receives:
+
+* Constant voltage setpoint
+* Constant current setpoint
+  * CC/CV settings can also be configured using the GUI.
+* BMS fault status
+
+The charger HMI automatically updates:
+
+* Constant Voltage (CV) target
+* Constant Current (CC) target
+* Fault indication
+
+### UART Communication
+
+Receives charger telemetry from the power stage.
+
+Example telemetry:
+
+```text
+VI:230.50, VO:54.30, IO:12.345, VB:48.20,
+PO:654.32, T1:25.10, T2:26.20, T3:27.30,
+ST:3, ER:00
 ```
-+------+------+------+------+------+------+
-| SOF  | ID_L | ID_H | DATA0| DATA1| CRC  |
-+------+------+------+------+------+------+
-   1B     1B     1B     1B     1B    1B
+
+The HMI parses incoming data and updates all UI elements in real time.
+The telemetry data is also shared via CAN for external debugging.
+
+### Fault Monitoring
+
+Monitored faults include:
+
+* Input undervoltage
+* Input overvoltage
+* Battery reverse polarity
+* Battery overvoltage
+* Output overcurrent
+* Output overvoltage
+* Output overpower
+* Overtemperature
+* UART RX timeout
+* CAN RX timeout
+
+Fault conditions are highlighted directly within the UI.
+
+---
+
+## Hardware
+
+### MCU
+
+* STM32G474RE
+
+### Display
+
+* ILI9488 TFT LCD
+* 480 × 320 resolution
+* SPI interface with DMA acceleration
+
+### Touch Controller
+
+* GT911
+* I2C interface
+
+### Communications
+
+* UART
+* CAN
+
+---
+
+## Software Architecture
+
+![Software Architecture](screenshots/architecture_diagram.png)
+
+---
+
+## CAN Protocol
+
+### Receive Message
+
+Extended ID:
+
+```text
+0x000000FF
 ```
 
----
+Payload format:
 
-## Field Descriptions
-
-### SOF (Start of Frame)
-
-* Fixed value: `0xA5`
-* Marks the beginning of a new packet
-* Allows the parser to resynchronize if bytes are lost or corrupted
-
----
-
-### ID (Message Identifier)
-
-* 16-bit value (little-endian)
-* Defines how the payload should be interpreted
+| Byte | Description          |
+| ---- | -------------------- |
+| 0-2  | Voltage setpoint (BCD) |
+| 3-5  | Current setpoint (BCD) |
+| 6-7  | BMS Error Code       |
 
 Example:
 
+```text
+48 27 35 68 12 34 00 00
 ```
-#define UART_ID_VOLTAGE 0x0001
-#define UART_ID_CURRENT 0x0002
+
+Decodes to:
+
+```text
+Voltage = 482.735 V
+Current = 6.81234 A
+Error Code = 0x0000
 ```
 
 ---
 
-### DATA (Payload)
+## UART Commands to HV MCU
 
-* Fixed 2-byte payload
-* Interpretation depends on the message ID
-* Values are encoded using packed decimal digits (BCD-style)
+### Set Voltage
 
-Each byte contains two decimal digits:
-
-```
-DATA0 = [d0 | d1]
-DATA1 = [d2 | d3]
+```text
+\V xxx
 ```
 
 Example:
 
+```text
+\V 400
 ```
-DATA0 = (d0 << 4) | d1
-DATA1 = (d2 << 4) | d3
-```
-
-Typical formats:
-
-* Voltage: `xxx.x` (e.g. 250.3 → digits 2,5,0,3)
-* Current: `xx.xx` (e.g. 7.52 → digits 0,7,5,2)
 
 ---
 
-### CRC (Checksum)
+### Set Current
 
-* 1-byte XOR checksum of all previous bytes:
-
-  * SOF
-  * ID_L
-  * ID_H
-  * DATA0
-  * DATA1
+```text
+\C x.xx
+```
 
 Example:
 
-```
-uint8_t crc = xor_crc(buf, 5);
-```
-
-* Used for basic error detection
-* Frames with invalid CRC are discarded
-
----
-
-## Example Frames
-
-### Voltage = 250.3 V
-
-* ID = `0x0001`
-* Digits: `2 5 0 3`
-* DATA0 = `0x25`
-* DATA1 = `0x03`
-
-Frame:
-
-```
-A5 01 00 25 03 CRC
+```text
+\C 6.50
 ```
 
 ---
 
-### Current = 7.52 A
+### Start / Stop Charger
 
-* ID = `0x0002`
-* Digits: `0 7 5 2`
-* DATA0 = `0x07`
-* DATA1 = `0x52`
-
-Frame:
-
-```
-A5 02 00 07 52 CRC
+```text
+\S
 ```
 
 ---
 
-## Parsing Strategy
+### Fault Command
 
-The receiver processes incoming bytes using a state machine:
+```text
+\F 1
+```
 
-1. Wait for `SOF (0xA5)`
-2. Read `ID_L`
-3. Read `ID_H`
-4. Read `DATA0`
-5. Read `DATA1`
-6. Read `CRC`
-7. Validate checksum
-8. If valid → output message
-9. If invalid → discard and wait for next SOF
+Fault active
+
+```text
+\F 0
+```
+
+Fault cleared
 
 ---
 
-## Notes
+## Future Improvements
 
-* This protocol currently uses a fixed 2-byte payload
-* Designed for fast, low-overhead MCU-to-MCU communication
-* Can be extended in future (e.g. adding a length field) if needed
+* Data logging
+* Charge session history
+* Firmware update capability
+* Remote monitoring interface
+* Additional fault diagnostics
+
+---
+
+## Author
+
+Chun Hei Wong
+
+4th Year Team Project
+
+The University of Manchester
+
+2026
