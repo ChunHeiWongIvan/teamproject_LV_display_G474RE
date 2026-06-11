@@ -267,13 +267,13 @@ AMS fault
 ### Set Voltage
 
 ```text
-\V xxx
+\V xxx\n
 ```
 
 Example:
 
 ```text
-\V 400
+\V 400\n
 ```
 
 ---
@@ -281,13 +281,13 @@ Example:
 ### Set Current
 
 ```text
-\C x.xx
+\C x.xx\n
 ```
 
 Example:
 
 ```text
-\C 6.50
+\C 6.50\n
 ```
 
 ---
