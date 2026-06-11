@@ -100,16 +100,22 @@ ST:3, ER:00
 ```
 
 The HMI parses incoming data and updates all UI elements in real time.
+The telemetry data is also shared via CAN for external debugging.
 
 ### Fault Monitoring
 
 Monitored faults include:
 
 * Input undervoltage
+* Input overvoltage
+* Battery reverse polarity
+* Battery overvoltage
 * Output overcurrent
 * Output overvoltage
 * Output overpower
 * Overtemperature
+* UART RX timeout
+* CAN RX timeout
 
 Fault conditions are highlighted directly within the UI.
 
@@ -284,36 +290,8 @@ Fault cleared
 
 ---
 
-## Project Structure
-
-```text
-Core/
-├── Src/
-├── Inc/
-
-Drivers/
-├── ILI9488
-├── GT911
-
-LVGL/
-├── UI
-├── EEZ Studio generated files
-
-Communication/
-├── UART
-├── CAN
-
-Application/
-├── State Machine
-├── Telemetry Processing
-├── Fault Handling
-```
-
----
-
 ## Future Improvements
 
-* CAN transmit support
 * Data logging
 * Charge session history
 * Firmware update capability
