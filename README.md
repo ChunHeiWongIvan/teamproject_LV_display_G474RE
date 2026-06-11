@@ -18,6 +18,57 @@ The user interface is implemented using LVGL and designed in EEZ Studio.
 
 ---
 
+## User Interface
+
+### Main Screen
+
+![Main Screen](screenshots/main_menu.png)
+
+Features:
+
+* Charger status
+* Live voltage/current display
+* CV and CC setpoints
+* Quick system overview
+
+---
+
+### Parameter Configuration
+
+![Parameter Configuration](screenshots/set_params.png)
+
+Features:
+
+* Constant Voltage adjustment
+* Constant Current adjustment
+* Safety limits
+
+---
+
+### Telemetry Charts
+
+![Telemetry Charts](screenshots/output_voltage.png)
+
+Features:
+
+* Live data plotting
+* Historical trend viewing
+* Multiple telemetry channels
+
+---
+
+### Debug Screen
+
+![Diagnostics](screenshots/debug_menu.png)
+
+Features:
+
+* Communication health monitoring
+* Fault reporting
+* Internal system status
+
+---
+
 ## User Flow Block Diagram
 
 ![Block Diagram](screenshots/block_diagram.png)
@@ -148,57 +199,6 @@ Fault conditions are highlighted directly within the UI.
 ## Software Architecture
 
 ![Software Architecture](screenshots/architecture_diagram.png)
-
----
-
-## User Interface
-
-### Main Screen
-
-![Main Screen](screenshots/main_menu.png)
-
-Features:
-
-* Charger status
-* Live voltage/current display
-* CV and CC setpoints
-* Quick system overview
-
----
-
-### Parameter Configuration
-
-![Parameter Configuration](screenshots/set_params.png)
-
-Features:
-
-* Constant Voltage adjustment
-* Constant Current adjustment
-* Safety limits
-
----
-
-### Telemetry Charts
-
-![Telemetry Charts](screenshots/output_voltage.png)
-
-Features:
-
-* Live data plotting
-* Historical trend viewing
-* Multiple telemetry channels
-
----
-
-### Debug Screen
-
-![Diagnostics](screenshots/debug_menu.png)
-
-Features:
-
-* Communication health monitoring
-* Fault reporting
-* Internal system status
 
 ---
 
