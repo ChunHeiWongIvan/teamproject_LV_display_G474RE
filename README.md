@@ -204,12 +204,12 @@ Fault conditions are highlighted directly within the UI.
 
 ## CAN Protocol
 
-### Receive Message
+### Receive CC/CV setpoint
 
 Extended ID:
 
 ```text
-0x000000FF
+0x00FFFFFF
 ```
 
 Payload format:
@@ -218,7 +218,7 @@ Payload format:
 | ---- | -------------------- |
 | 0-2  | Voltage setpoint (BCD) |
 | 3-5  | Current setpoint (BCD) |
-| 6-7  | BMS Error Code       |
+| 6-7  | RESERVED               |
 
 Example:
 
@@ -234,6 +234,32 @@ Current = 6.81234 A
 Error Code = 0x0000
 ```
 
+### Status message stream
+
+Extended ID:
+
+```text
+0x001FFFFF
+```
+
+Payload format:
+
+| Byte | Description          |
+| ---- | -------------------- |
+| 0-2  | Charger status code    |
+| 3-7  | RESERVED               |
+
+Example:
+
+```text
+AA 00 00 00 00 00 00 00
+```
+
+Decodes to:
+
+```text
+AMS fault
+```
 ---
 
 ## UART Commands to HV MCU
