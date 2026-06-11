@@ -18,6 +18,12 @@ The user interface is implemented using LVGL and designed in EEZ Studio.
 
 ---
 
+## User Flow Block Diagram
+
+![Block Diagram](screenshots/block_diagram.png)
+
+---
+
 ## Features
 
 ### Touchscreen User Interface
@@ -133,22 +139,9 @@ Fault conditions are highlighted directly within the UI.
 
 ---
 
-## Software Stack
+## Software Architecture
 
-### Frameworks
-
-* STM32 HAL
-* LVGL
-* EEZ Studio
-
-### Drivers
-
-* ILI9488 LCD Driver
-* GT911 Touch Driver
-
-### Development Environment
-
-* STM32CubeIDE
+![Software Architecture](screenshots/architecture_diagram.png)
 
 ---
 
