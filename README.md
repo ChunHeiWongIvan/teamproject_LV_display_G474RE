@@ -1,4 +1,4 @@
-# Formula Student Charger LV/ Human-Machine Interface (HMI)
+# Formula Student Charger LV/ Human-Machine Interface (HMI) Firmware
 
 ## Overview
 
